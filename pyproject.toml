@@ -1,0 +1,10 @@
+[project]
+name = "zero-crop"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pymupdf>=1.27.2.2",
+    "wikipedia>=1.4.0",
+]
