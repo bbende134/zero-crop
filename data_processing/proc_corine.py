@@ -99,7 +99,7 @@ if __name__ == "__main__":
     parsed_classes = extract_classes_from_pdf()
     
     # Filter by codes present in the geojson
-    geojson_path = DATA_DIR / "U2018_CLC2018_V2020_20u1.json"
+    geojson_path = DATA_DIR / "Results" / "U2018_CLC2018_V2020_20u1.json"
     valid_codes = set()
     if geojson_path.exists():
         print("Reading GeoJSON to determine valid codes...")
