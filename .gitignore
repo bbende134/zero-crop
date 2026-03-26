@@ -8,3 +8,12 @@ wheels/
 
 # Virtual environments
 .venv
+data_corine/*
+
+.env
+keys.json
+
+training_data/
+inference_outputs/
+*.pt
+key.json

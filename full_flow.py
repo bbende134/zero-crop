@@ -64,8 +64,8 @@ class PipelineConfig:
     
     # --- Model ---
     n_bases: int = 24          # Number of spatial basis functions
-    n_fourier_freqs: int = 32 # Fourier feature frequencies
-    hidden_dim: int = 128
+    n_fourier_freqs: int = 64  # Fourier feature frequencies
+    hidden_dim: int = 256
     text_emb_dim: int = 2560   # Qwen3-Embedding-4B hidden dim
     
     # --- Training ---
@@ -440,6 +440,7 @@ def process_corine_geojson(cfg: PipelineConfig) -> Dict[str, Dict]:
 # PART 3: TEXT DESCRIPTION → EMBEDDING PAIRING
 # ============================================================
 
+# 
 def build_training_pairs(
     distributions: Dict[str, Dict],
     descriptions_path: str,
@@ -823,8 +824,6 @@ class SpatialBasisField(nn.Module):
             maps.append(b)
         return maps
 
-
-
 # ============================================================
 # PART 6: TRAINING LOOP
 # ============================================================
@@ -913,23 +912,7 @@ def train(model, dataset, cfg: PipelineConfig, device="cuda", sample_pairs=None,
             # Loss: MSE + signal-aware weighting
             weights = 1.0 + 4.0 * targets  # Background=1x, signal up to 5x
             loss = (weights * (preds - targets) ** 2).mean()
-            # Get unique maps in this batch
-            unique_maps = torch.unique(map_indices)
-            if len(unique_maps) >= 2:
-                # Pick two different classes
-                idx_a = (map_indices == unique_maps[0]).nonzero()[:64]
-                idx_b = (map_indices == unique_maps[1]).nonzero()[:64]
-        
-                if len(idx_a) > 0 and len(idx_b) > 0:
-                    # At the SAME coordinates, different text should give different predictions
-                    shared_coords = coords[idx_a[:len(idx_b)]].squeeze(1)
-                    
-                    pred_a = model(shared_coords, text_embs[idx_a[:len(idx_b)]].squeeze(1))
-                    pred_b = model(shared_coords, text_embs[idx_b[:len(idx_a)]].squeeze(1))
-            
-                    # They should differ — penalize similarity
-                    discrimination_loss = -((pred_a - pred_b) ** 2).mean()
-                    loss = loss + 0.5 * discrimination_loss
+
             # Backward
             optimizer.zero_grad()
             loss.backward()
@@ -1024,18 +1007,7 @@ def _cfg_hash(*parts) -> str:
     """12-char MD5 of config fields — used as cache key."""
     blob = "|".join(str(p) for p in parts)
     return hashlib.md5(blob.encode()).hexdigest()[:12]
-def split_pairs_by_class(pairs, val_fraction=0.2):
-    """Hold out entire classes for validation."""
-    n_val = max(1, round(len(pairs) * val_fraction))
-    # Shuffle deterministically
-    indices = list(range(len(pairs)))
-    rng = np.random.RandomState(42)
-    rng.shuffle(indices)
-    val_indices = set(indices[:n_val])
-    
-    train_pairs = [p for i, p in enumerate(pairs) if i not in val_indices]
-    val_pairs = [p for i, p in enumerate(pairs) if i in val_indices]
-    return train_pairs, val_pairs
+
 
 def split_pairs_train_val(pairs: List[Dict], val_fraction: float = 0.25) -> Tuple[List[Dict], List[Dict]]:
     """Split sentence embeddings per class into train / val sets.
@@ -1133,7 +1105,7 @@ def main():
     print("\n" + "=" * 60)
     print("STEP 3: Build coordinate-level training dataset")
     print("=" * 60)
-    train_pairs, val_pairs = split_pairs_by_class(pairs, val_fraction=0.25)
+    train_pairs, val_pairs = split_pairs_train_val(pairs, val_fraction=0.25)
     print(f"  Train sentences: {sum(len(p['sentence_embeddings']) for p in train_pairs)}, "
           f"Val sentences: {sum(len(p['sentence_embeddings']) for p in val_pairs)}")
 
@@ -1152,7 +1124,7 @@ def main():
         n_freqs=cfg.n_fourier_freqs,
         hidden_dim=cfg.hidden_dim,
     )
- 
+    
     model = train(model, dataset, cfg, device, sample_pairs=pairs, val_dataset=val_dataset)
 
     # Step 5: Save model and generate sample outputs

@@ -1,0 +1,949 @@
+"""
+SpatialBasisField v2 — Text-conditioned spatial distribution model
+===================================================================
+
+Key changes from v1:
+  1. FiLM conditioning: text modulates spatial features at every layer
+  2. Sigmoid factors: independent gating instead of softmax winner-take-all
+  3. Reduced coordinate capacity: forces reliance on text signal
+  4. Discrimination loss: penalizes identical outputs for different texts
+  5. Class-level val split: measures actual generalization
+  6. Text dropout: random zeroing of text embedding during training (like CFG)
+"""
+
+import hashlib
+import json
+import math
+import pickle
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from tqdm import tqdm
+from pathlib import Path
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+@dataclass
+class PipelineConfig:
+    # --- Data paths ---
+    r3_dir: str = "data_corine/Results-3"
+    r4_dir: str = "data_corine/Results-4"
+    corine_geojson_path: str = "data_corine/Results/U2018_CLC2018_V2020_20u1.json"
+    text_descriptions_path: str = "data_corine/corine_wiki_char_count.jsonl"
+    hrl_descriptions_path: str = "data_corine/hrl_wiki_char_count.jsonl"
+    output_dir: str = "training_data"
+    cache_dir: str = "pipeline_cache"
+
+    # --- Geographic bounds (Hungary) ---
+    lat_min: float = 45.737
+    lat_max: float = 48.585
+    lon_min: float = 16.113
+    lon_max: float = 22.897
+
+    # --- Processing ---
+    target_resolution: int = 256
+    min_pixels_for_class: int = 500
+
+    # --- Model (reduced capacity vs v1) ---
+    n_bases: int = 24
+    n_fourier_freqs: int = 32       # was 64 — less spatial memorization
+    hidden_dim: int = 128            # was 256 — forces text reliance
+    coord_hidden: int = 128          # trunk width
+    text_emb_dim: int = 2560         # Qwen3 hidden dim
+    text_proj_dim: int = 128         # project text down before FiLM
+
+    # --- Training ---
+    n_epochs: int = 400
+    lr: float = 3e-4
+    qwen_lr: float = 3e-5            # 10x lower LR for Qwen LoRA
+    batch_size: int = 65_536
+    qwen_batch_size: int = 16         # max texts per Qwen forward (grad checkpoint saves memory)
+    samples_per_epoch: int = 2_000_000
+    val_samples: int = 100_000
+    weight_decay: float = 1e-5
+    text_dropout: float = 0.1        # fraction of samples with zeroed text
+    discrimination_weight: float = 0.5
+    disc_warmup_epochs: int = 50     # disc weight = 0 for this many epochs, then ramp up
+    disc_ramp_epochs: int = 50       # ramp from 0 → full weight over this many epochs
+    plot_every: int = 20
+    val_class_fraction: float = 0.2  # hold out this fraction of classes
+    fine_tune_qwen: bool = True      # fine-tune Qwen embeddings with LoRA
+
+    @property
+    def target_width(self):
+        aspect = (self.lon_max - self.lon_min) / (self.lat_max - self.lat_min)
+        return int(self.target_resolution * aspect)
+
+
+# ============================================================
+# MODEL
+# ============================================================
+
+class FourierFeatures(nn.Module):
+    """Random Fourier features for coordinate encoding."""
+
+    def __init__(self, n_input: int = 2, n_freqs: int = 32, sigma: float = 10.0):
+        super().__init__()
+        self.n_freqs = n_freqs
+        B = torch.randn(n_input, n_freqs) * sigma
+        self.register_buffer('B', B)
+
+    @property
+    def output_dim(self):
+        return 2 + 2 * self.n_freqs
+
+    def forward(self, coords):
+        proj = coords @ self.B
+        return torch.cat([coords, torch.sin(2 * math.pi * proj),
+                          torch.cos(2 * math.pi * proj)], dim=-1)
+
+
+class FiLMLayer(nn.Module):
+    """Single linear layer with Feature-wise Linear Modulation from text.
+
+    h = SiLU(gamma * Linear(x) + beta)
+    where (gamma, beta) = Linear(text_emb)
+    """
+
+    def __init__(self, in_dim: int, out_dim: int, cond_dim: int):
+        super().__init__()
+        self.linear = nn.Linear(in_dim, out_dim)
+        self.film = nn.Linear(cond_dim, out_dim * 2)
+        # Initialize film to identity modulation: gamma=1, beta=0
+        nn.init.zeros_(self.film.weight)
+        nn.init.constant_(self.film.bias[:out_dim], 1.0)   # gamma = 1
+        nn.init.zeros_(self.film.bias[out_dim:])             # beta = 0
+
+    def forward(self, x, cond):
+        h = self.linear(x)
+        gamma, beta = self.film(cond).chunk(2, dim=-1)
+        return F.silu(gamma * h + beta)
+
+
+class SpatialBasisFieldV2(nn.Module):
+    """Text-conditioned spatial distribution model with FiLM conditioning.
+
+    Architecture:
+        Text path:
+            text_emb (2560) → LayerNorm → project (128) → conditions every layer
+
+        Coord path (FiLM-conditioned by text at every layer):
+            (lat, lon) → Fourier(32 freqs) → FiLM-MLP(128) → 128-dim features
+
+        Basis heads:
+            128 → 64 → 1 (sigmoid) per basis  ×  K bases
+
+        Factor head:
+            text_proj (128) → MLP → K factors (sigmoid, independent gating)
+
+        Output:
+            Σ_k  factor_k × basis_k(lat, lon)
+
+    Key design decisions:
+        - FiLM makes spatial features text-dependent at every layer
+        - Sigmoid factors: each basis independently gated (no winner-take-all)
+        - Reduced Fourier freqs (32 not 64): spatial trunk can't memorize alone
+        - Text dropout: zeroes text randomly → model must gracefully degrade
+        - No basis_scale/bias params: sigmoid heads already output [0,1]
+    """
+
+    def __init__(self, text_dim=2560, text_proj_dim=128, n_bases=24,
+                 n_freqs=32, hidden_dim=128, coord_hidden=128):
+        super().__init__()
+        self.n_bases = n_bases
+        self.text_proj_dim = text_proj_dim
+
+        # --- Text projection ---
+        self.text_norm = nn.LayerNorm(text_dim)
+        self.text_proj = nn.Sequential(
+            nn.Linear(text_dim, text_proj_dim),
+            nn.SiLU(),
+        )
+
+        # --- Text → factor weights (sigmoid, not softmax) ---
+        self.text_to_factors = nn.Sequential(
+            nn.Linear(text_proj_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, n_bases),
+            # sigmoid applied in forward()
+        )
+
+        # --- Coordinate encoding ---
+        self.fourier = FourierFeatures(n_input=2, n_freqs=n_freqs)
+
+        # --- FiLM-conditioned coordinate trunk ---
+        coord_input_dim = self.fourier.output_dim
+        self.trunk_layer1 = FiLMLayer(coord_input_dim, coord_hidden, text_proj_dim)
+        self.trunk_layer2 = FiLMLayer(coord_hidden, coord_hidden, text_proj_dim)
+        self.trunk_layer3 = FiLMLayer(coord_hidden, coord_hidden, text_proj_dim)
+
+        # --- Vectorized basis heads (single batched op, not 24 sequential) ---
+        self.basis_hidden_dim = hidden_dim // 2
+        self.basis_layer1 = nn.Linear(coord_hidden, n_bases * self.basis_hidden_dim)
+        self.basis_layer2_w = nn.Parameter(torch.randn(n_bases, self.basis_hidden_dim, 1) * 0.02)
+        self.basis_layer2_b = nn.Parameter(torch.zeros(n_bases, 1))
+
+    def _get_text_cond(self, text_emb):
+        """Project text to conditioning vector."""
+        return self.text_proj(self.text_norm(text_emb))
+
+    def forward(self, coords, text_emb):
+        """
+        coords:   (B, 2) normalized lat/lon in [-1, 1]
+        text_emb: (B, text_dim) text embedding
+
+        Returns:  (B,) predicted density in [0, 1]
+        """
+        # Text conditioning
+        text_cond = self._get_text_cond(text_emb)  # (B, text_proj_dim)
+
+        # Factor weights — sigmoid for independent gating
+        factors = torch.sigmoid(self.text_to_factors(text_cond))  # (B, n_bases)
+
+        # Coordinate features — FiLM conditioned by text
+        coord_feat = self.fourier(coords)                            # (B, fourier_dim)
+        h = self.trunk_layer1(coord_feat, text_cond)                 # (B, coord_hidden)
+        h = self.trunk_layer2(h, text_cond)                          # (B, coord_hidden)
+        h = self.trunk_layer3(h, text_cond)                          # (B, coord_hidden)
+
+        # Evaluate all basis heads in one vectorized op
+        h_bases = self.basis_layer1(h)                                         # (B, K*D)
+        h_bases = F.silu(h_bases.view(-1, self.n_bases, self.basis_hidden_dim)) # (B, K, D)
+        basis_out = torch.einsum('bkd,kdo->bk', h_bases, self.basis_layer2_w) + self.basis_layer2_b.squeeze(-1)
+        basis_out = torch.sigmoid(basis_out)                                   # (B, K)
+
+        # Weighted combination (mean, not sum — sum of 24 sigmoids saturates clamp)
+        density = (basis_out * factors).mean(dim=-1)  # (B,)
+        return density.clamp(0, 1)
+
+    @torch.no_grad()
+    def render_map(self, text_emb, H=256, W=480, device="cuda"):
+        """Render a full density map for a given text embedding."""
+        self.eval()
+        lat_grid = torch.linspace(-1, 1, H, device=device)
+        lon_grid = torch.linspace(-1, 1, W, device=device)
+        grid_lat, grid_lon = torch.meshgrid(lat_grid, lon_grid, indexing='ij')
+        coords = torch.stack([grid_lat.flatten(), grid_lon.flatten()], dim=-1)
+
+        if text_emb.dim() == 1:
+            text_emb = text_emb.unsqueeze(0)
+        text_emb = text_emb.to(device)
+        text_expanded = text_emb.expand(coords.shape[0], -1)
+
+        chunk = 100_000
+        parts = []
+        for i in range(0, len(coords), chunk):
+            parts.append(self.forward(coords[i:i+chunk], text_expanded[i:i+chunk]))
+        return torch.cat(parts).view(H, W).cpu().numpy()
+
+    @torch.no_grad()
+    def get_basis_maps(self, H=256, W=480, device="cuda"):
+        """Render all basis maps using a neutral (zero) text conditioning."""
+        self.eval()
+        lat_grid = torch.linspace(-1, 1, H, device=device)
+        lon_grid = torch.linspace(-1, 1, W, device=device)
+        grid_lat, grid_lon = torch.meshgrid(lat_grid, lon_grid, indexing='ij')
+        coords = torch.stack([grid_lat.flatten(), grid_lon.flatten()], dim=-1)
+
+        # Zero text → FiLM gives identity-ish modulation (due to init)
+        zero_text = torch.zeros(1, self.text_proj_dim, device=device)
+        zero_text_expanded = zero_text.expand(coords.shape[0], -1)
+
+        coord_feat = self.fourier(coords)
+        h = self.trunk_layer1(coord_feat, zero_text_expanded)
+        h = self.trunk_layer2(h, zero_text_expanded)
+        h = self.trunk_layer3(h, zero_text_expanded)
+
+        h_bases = self.basis_layer1(h)
+        h_bases = F.silu(h_bases.view(-1, self.n_bases, self.basis_hidden_dim))
+        basis_logits = torch.einsum('bkd,kdo->bk', h_bases, self.basis_layer2_w) + self.basis_layer2_b.squeeze(-1)
+        basis_all = torch.sigmoid(basis_logits)  # (H*W, K)
+        maps = [basis_all[:, k].view(H, W).cpu().numpy() for k in range(self.n_bases)]
+        return maps
+
+
+def load_raw_texts(descriptions_path, extra_paths=None):
+    """Load raw text sentences from JSONL files. Returns {desc_key: [sentences]}."""
+    descriptions = {}
+
+    def _load(path):
+        p = Path(path)
+        if not p.exists():
+            return
+        if p.suffix == ".jsonl":
+            with open(p, encoding="utf-8") as f:
+                for line in f:
+                    rec = json.loads(line)
+                    key = rec.get("code", "")
+                    texts = rec.get("wiki_texts", {})
+                    chunks = []
+                    for article in texts.values():
+                        sents = [s.strip() for s in article.replace("\n", " ").split(". ") if len(s.strip()) > 30]
+                        chunks.extend(sents[:10])
+                    if chunks:
+                        descriptions[key] = chunks
+
+    _load(descriptions_path)
+    for extra in (extra_paths or []):
+        _load(extra)
+    return descriptions
+
+
+# ============================================================
+# GPU-NATIVE DATA SAMPLER
+# ============================================================
+
+class GPUSampler:
+    """GPU-native data sampler — all sampling happens on GPU, no DataLoader.
+
+    Preloads density maps and text embeddings as GPU tensors.
+    Stores raw text sentences per map for on-the-fly Qwen encoding.
+    50% uniform coordinates, 50% importance-sampled from signal regions.
+    """
+
+    def __init__(self, pairs, cfg, device="cuda",
+                 n_text_tokens=8, text_dropout=0.0, raw_texts=None):
+        self.device = device
+        self.n_maps = len(pairs)
+        self.n_text_tokens = n_text_tokens
+        self.text_dropout = text_dropout
+        self.batch_size = cfg.batch_size
+        self.samples_per_epoch = cfg.samples_per_epoch
+
+        # All maps are same shape (target_resolution, target_width)
+        H, W = pairs[0]["density_map"].shape
+        self.H, self.W = H, W
+
+        # Stack all density maps: (n_maps, H*W)
+        density_flat = np.stack([p["density_map"].flatten() for p in pairs])
+        self.density_maps = torch.from_numpy(
+            np.stack([p["density_map"] for p in pairs])
+        ).float().to(device)
+        self.density_flat = self.density_maps.view(self.n_maps, -1)
+
+        # Importance sampling weights per map: (n_maps, H*W)
+        probs = torch.from_numpy(density_flat).float() + 1e-6
+        probs = probs / probs.sum(dim=1, keepdim=True)
+        self.sample_weights = probs.to(device)
+
+        # Precomputed text embeddings (for frozen mode / validation)
+        self.avg_embeddings = torch.stack(
+            [p["avg_embedding"] for p in pairs]
+        ).float().to(device)
+
+        max_sents = max(len(p["sentence_embeddings"]) for p in pairs)
+        emb_dim = pairs[0]["sentence_embeddings"].shape[-1]
+        self.sent_embs = torch.zeros(self.n_maps, max_sents, emb_dim, device=device)
+        self.n_sents = torch.zeros(self.n_maps, dtype=torch.long, device=device)
+        for i, p in enumerate(pairs):
+            n = len(p["sentence_embeddings"])
+            self.sent_embs[i, :n] = p["sentence_embeddings"].to(device)
+            self.n_sents[i] = n
+
+        # Raw text sentences per map (for on-the-fly Qwen encoding)
+        self.raw_sentences = None  # list of list of strings
+        if raw_texts is not None:
+            self.raw_sentences = []
+            for p in pairs:
+                desc_key = p.get("desc_key", p["class_name"])
+                sents = raw_texts.get(desc_key, [f"{p['class_name']} in Hungary"])
+                self.raw_sentences.append(sents)
+
+        print(f"  GPUSampler: {self.n_maps} maps, {H}x{W}, "
+              f"{max_sents} max sents, "
+              f"raw_texts={'yes' if self.raw_sentences else 'no'}")
+
+    def __len__(self):
+        return self.samples_per_epoch
+
+    @property
+    def n_batches(self):
+        return self.samples_per_epoch // self.batch_size
+
+    def _sample_coords_and_targets(self, B):
+        """Sample coordinates and density targets on GPU."""
+        device = self.device
+        map_indices = torch.randint(0, self.n_maps, (B,), device=device)
+        half = B // 2
+
+        y_uniform = torch.randint(0, self.H, (half,), device=device)
+        x_uniform = torch.randint(0, self.W, (half,), device=device)
+
+        imp_maps = map_indices[half:]
+        chunk_size = 2048
+        flat_idx_parts = []
+        for i in range(0, len(imp_maps), chunk_size):
+            chunk_w = self.sample_weights[imp_maps[i:i+chunk_size]]
+            flat_idx_parts.append(torch.multinomial(chunk_w, 1).squeeze(-1))
+        flat_idx = torch.cat(flat_idx_parts)
+        y_imp = flat_idx // self.W
+        x_imp = flat_idx % self.W
+
+        y_all = torch.cat([y_uniform, y_imp])
+        x_all = torch.cat([x_uniform, x_imp])
+        flat_coords = y_all * self.W + x_all
+        targets = self.density_flat[map_indices, flat_coords]
+
+        lat_norm = (y_all.float() / self.H) * 2 - 1
+        lon_norm = (x_all.float() / self.W) * 2 - 1
+        coords = torch.stack([lat_norm, lon_norm], dim=-1)
+
+        return coords, targets, map_indices
+
+    def _sample_precomputed_embs(self, map_indices):
+        """Sample text embeddings from precomputed cache."""
+        B = len(map_indices)
+        n_tok = self.n_text_tokens
+        map_n_sents = self.n_sents[map_indices]
+        rand_idx = torch.rand(B, n_tok, device=self.device)
+        sent_idx = (rand_idx * map_n_sents.unsqueeze(1).float()).long()
+        sent_idx = sent_idx.clamp(max=self.sent_embs.shape[1] - 1)
+        expanded_maps = map_indices.unsqueeze(1).expand(-1, n_tok)
+        selected = self.sent_embs[expanded_maps, sent_idx]
+        text_embs = selected.mean(dim=1)
+
+        if self.text_dropout > 0:
+            mask = torch.rand(B, device=self.device) < self.text_dropout
+            text_embs[mask] = 0.0
+
+        return text_embs
+
+    def sample_batch(self):
+        """Batch with precomputed embeddings (no Qwen forward)."""
+        B = self.batch_size
+        coords, targets, map_indices = self._sample_coords_and_targets(B)
+        text_embs = self._sample_precomputed_embs(map_indices)
+        return coords, text_embs, targets, map_indices
+
+    def sample_texts_for_maps(self, map_indices):
+        """Pick one random raw text sentence per map index. Returns list of strings."""
+        if self.raw_sentences is None:
+            raise RuntimeError("GPUSampler has no raw_sentences (pass raw_texts to constructor)")
+        import random
+        map_list = map_indices.cpu().tolist()
+        # For efficiency, pick one unique text per unique map in the batch
+        unique_maps = list(set(map_list))
+        map_to_text = {}
+        for m in unique_maps:
+            sents = self.raw_sentences[m]
+            map_to_text[m] = random.choice(sents)
+        return [map_to_text[m] for m in unique_maps], unique_maps
+
+
+# ============================================================
+# TRAINING
+# ============================================================
+
+def compute_discrimination_loss(model, coords, text_embs, map_indices, n_coords=32):
+    """At shared coordinates, different text should produce different outputs.
+
+    Iterates over ALL unique class pairs in the batch (not just one random pair),
+    uses shared coordinates, and penalizes predictions being too similar.
+    Loss: 1 / (1 + |pred_a - pred_b|)  → 1 when identical, → 0 when different.
+    """
+    unique_maps = torch.unique(map_indices)
+    n_classes = len(unique_maps)
+    if n_classes < 2:
+        return torch.tensor(0.0, device=coords.device)
+
+    # Precompute indices per class
+    class_indices = {}
+    for m in unique_maps:
+        class_indices[m.item()] = (map_indices == m).nonzero(as_tuple=True)[0]
+
+    total_loss = torch.tensor(0.0, device=coords.device)
+    n_pairs_done = 0
+
+    # Cap the number of class pairs to avoid blowup with many classes
+    class_list = unique_maps.tolist()
+    max_pairs = 10
+    if n_classes * (n_classes - 1) // 2 > max_pairs:
+        # Random subset of pairs
+        import itertools
+        all_pairs = list(itertools.combinations(class_list, 2))
+        perm = torch.randperm(len(all_pairs))[:max_pairs].tolist()
+        pair_list = [all_pairs[i] for i in perm]
+    else:
+        import itertools
+        pair_list = list(itertools.combinations(class_list, 2))
+
+    for map_a, map_b in pair_list:
+        idx_a = class_indices[map_a]
+        idx_b = class_indices[map_b]
+        n = min(n_coords, len(idx_a), len(idx_b))
+        if n < 2:
+            continue
+
+        # Random subset of coordinates
+        sel_a = idx_a[torch.randperm(len(idx_a))[:n]]
+        sel_b = idx_b[torch.randperm(len(idx_b))[:n]]
+
+        # Use coordinates from class A, query with both text embeddings
+        shared_coords = coords[sel_a]
+        pred_a = model(shared_coords, text_embs[sel_a])
+        pred_b = model(shared_coords, text_embs[sel_b])
+
+        # 1/(1+|diff|) — penalizes similarity, good gradients everywhere
+        diff = (pred_a - pred_b).abs()
+        total_loss = total_loss + (1.0 / (1.0 + diff)).mean()
+        n_pairs_done += 1
+
+    if n_pairs_done == 0:
+        return torch.tensor(0.0, device=coords.device)
+    return total_loss / n_pairs_done
+
+
+def split_pairs_by_class(pairs, val_fraction=0.2, seed=42):
+    """Hold out entire classes for validation.
+
+    This tests whether the model generalizes to unseen text→spatial mappings,
+    not just unseen sentences for known classes.
+    """
+    n_val = max(1, round(len(pairs) * val_fraction))
+    indices = list(range(len(pairs)))
+    rng = np.random.RandomState(seed)
+    rng.shuffle(indices)
+    val_set = set(indices[:n_val])
+
+    train = [p for i, p in enumerate(pairs) if i not in val_set]
+    val = [p for i, p in enumerate(pairs) if i in val_set]
+
+    print(f"  Train classes: {len(train)}, Val classes: {len(val)}")
+    print(f"  Val class names: {[p['class_name'] for p in val]}")
+    return train, val
+
+
+def train(model, train_sampler, cfg, device="cuda", sample_pairs=None,
+          val_sampler=None, text_encoder=None):
+    """Training loop with GPU-native sampling, AMP, discrimination loss,
+    and optional Qwen fine-tuning."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    model.to(device)
+
+    # Resume from checkpoint
+    ckpt_path = Path(cfg.output_dir) / "checkpoint_v2.pt"
+    start_epoch = 0
+    epoch_losses, val_losses = [], []
+    disc_losses = []
+    saved_opt, saved_sched = None, None
+
+    if ckpt_path.exists():
+        print(f"[resume] Loading {ckpt_path}")
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model"])
+        saved_opt = ckpt["optimizer"]
+        saved_sched = ckpt["scheduler"]
+        start_epoch = ckpt["epoch"] + 1
+        epoch_losses = ckpt.get("losses", [])
+        val_losses = ckpt.get("val_losses", [])
+        disc_losses = ckpt.get("disc_losses", [])
+        if text_encoder is not None and "qwen_lora" in ckpt:
+            # Load LoRA weights from checkpoint
+            te_module = text_encoder
+            te_module._model.load_state_dict(ckpt["qwen_lora"], strict=False)
+            print(f"  Loaded Qwen LoRA weights from checkpoint")
+        print(f"  Resuming from epoch {start_epoch}")
+
+    # Optimizer: separate param groups for spatial model and Qwen LoRA
+    param_groups = [
+        {"params": model.parameters(), "lr": cfg.lr, "weight_decay": cfg.weight_decay},
+    ]
+    if text_encoder is not None:
+        te_module = text_encoder
+        qwen_params = [p for p in te_module.parameters() if p.requires_grad]
+        n_qwen = sum(p.numel() for p in qwen_params)
+        print(f"  Qwen LoRA trainable params: {n_qwen:,}")
+        param_groups.append(
+            {"params": qwen_params, "lr": cfg.qwen_lr, "weight_decay": 0.0}
+        )
+
+    optimizer = torch.optim.AdamW(param_groups, foreach=False)
+    if saved_opt:
+        try:
+            optimizer.load_state_dict(saved_opt)
+        except (ValueError, KeyError):
+            print("  [warn] Could not restore optimizer state (param groups changed)")
+
+    n_batches_per_epoch = train_sampler.n_batches
+    total_steps = n_batches_per_epoch * cfg.n_epochs
+    warmup_steps = int(total_steps * 0.05)
+
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / max(1, warmup_steps)
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        return 0.01 + 0.99 * 0.5 * (1 + math.cos(math.pi * progress))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    if saved_sched:
+        try:
+            scheduler.load_state_dict(saved_sched)
+        except (ValueError, KeyError):
+            print("  [warn] Could not restore scheduler state")
+
+    viz_dir = Path(cfg.output_dir) / "training_viz_v2"
+    if cfg.plot_every > 0:
+        viz_dir.mkdir(parents=True, exist_ok=True)
+
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"\nTraining: {n_params:,} spatial params, {train_sampler.samples_per_epoch:,} samples/epoch")
+    print(f"  {n_batches_per_epoch} batches/epoch × {cfg.batch_size:,} = {n_batches_per_epoch * cfg.batch_size:,} samples")
+    print(f"  Discrimination weight: {cfg.discrimination_weight}")
+    print(f"  Text dropout: {cfg.text_dropout}")
+    print(f"  Batch size: {cfg.batch_size:,}")
+    print(f"  Qwen fine-tune: {'ON' if text_encoder else 'OFF'}")
+    print(f"  AMP: bfloat16")
+
+    model.train()
+    if text_encoder is not None:
+        te_module = text_encoder
+        te_module.train()
+
+    for epoch in range(start_epoch, cfg.n_epochs):
+        ep_mse, ep_disc = 0.0, 0.0
+
+        pbar = tqdm(range(n_batches_per_epoch), desc=f"Epoch {epoch+1:3d}",
+                    leave=False, ncols=120)
+        for batch_i in pbar:
+            # --- GPU-native batch generation ---
+            coords, targets, map_indices = train_sampler._sample_coords_and_targets(cfg.batch_size)
+
+            # --- Text embeddings: on-the-fly Qwen or precomputed ---
+            if text_encoder is not None and train_sampler.raw_sentences is not None:
+                # Get unique texts for this batch
+                texts, unique_map_list = train_sampler.sample_texts_for_maps(map_indices)
+
+                # Tokenize on CPU, encode on Qwen's device (GPU 1)
+                tokenizer = text_encoder.tokenizer
+                qwen_dev = next(text_encoder.parameters()).device
+                chunk_size = cfg.qwen_batch_size
+                emb_parts = []
+                for ci in range(0, len(texts), chunk_size):
+                    chunk_texts = texts[ci:ci + chunk_size]
+                    inputs = tokenizer(
+                        chunk_texts, return_tensors="pt",
+                        truncation=True, max_length=512, padding=True,
+                    )
+                    input_ids = inputs["input_ids"].to(qwen_dev)
+                    attn_mask = inputs["attention_mask"].to(qwen_dev)
+                    with torch.autocast(qwen_dev.type, dtype=torch.bfloat16):
+                        emb_parts.append(text_encoder(input_ids, attn_mask))
+                unique_embs = torch.cat(emb_parts, dim=0).to(device)  # transfer to GPU 0
+
+                # Map unique embeddings back to full batch
+                map_to_idx = {m: i for i, m in enumerate(unique_map_list)}
+                batch_emb_idx = torch.tensor(
+                    [map_to_idx[m.item()] for m in map_indices], device=device
+                )
+                text_embs = unique_embs[batch_emb_idx]
+            else:
+                text_embs = train_sampler._sample_precomputed_embs(map_indices)
+
+            # Text dropout
+            if cfg.text_dropout > 0:
+                mask = torch.rand(len(text_embs), device=device) < cfg.text_dropout
+                text_embs = text_embs.clone()
+                text_embs[mask] = 0.0
+
+            # --- Forward with AMP ---
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                preds = model(coords, text_embs)
+                weights = 1.0 + 4.0 * targets
+                mse_loss = (weights * (preds - targets) ** 2).mean()
+
+                disc_loss = compute_discrimination_loss(
+                    model, coords, text_embs, map_indices, n_coords=32
+                )
+
+                if epoch < cfg.disc_warmup_epochs:
+                    disc_w = 0.0
+                elif epoch < cfg.disc_warmup_epochs + cfg.disc_ramp_epochs:
+                    disc_w = cfg.discrimination_weight * (
+                        (epoch - cfg.disc_warmup_epochs) / cfg.disc_ramp_epochs
+                    )
+                else:
+                    disc_w = cfg.discrimination_weight
+
+                loss = mse_loss + disc_w * disc_loss
+
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            if text_encoder is not None:
+                te_module = text_encoder
+                torch.nn.utils.clip_grad_norm_(te_module.parameters(), 1.0)
+            optimizer.step()
+            scheduler.step()
+
+            ep_mse += mse_loss.item()
+            ep_disc += disc_loss.item()
+
+            # Update progress bar
+            pbar.set_postfix({
+                "mse": f"{ep_mse/(batch_i+1):.4f}",
+                "disc": f"{ep_disc/(batch_i+1):.4f}",
+                "lr": f"{optimizer.param_groups[0]['lr']:.1e}",
+            })
+
+        avg_mse = ep_mse / n_batches_per_epoch
+        avg_disc = ep_disc / n_batches_per_epoch
+        epoch_losses.append(avg_mse)
+        disc_losses.append(avg_disc)
+
+        # --- Validation (always uses precomputed embeddings) ---
+        avg_val = float("nan")
+        if val_sampler is not None:
+            model.eval()
+            val_sum = 0.0
+            n_val_batches = val_sampler.n_batches
+            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                for _ in range(n_val_batches):
+                    c, t, tgt, _ = val_sampler.sample_batch()
+                    p = model(c, t)
+                    w = 1.0 + 4.0 * tgt
+                    val_sum += (w * (p - tgt) ** 2).mean().item()
+            avg_val = val_sum / max(1, n_val_batches)
+            val_losses.append(avg_val)
+            model.train()
+            if text_encoder is not None:
+                te_module = text_encoder
+                te_module.train()
+
+        lr_now = optimizer.param_groups[0]['lr']
+        qwen_lr_str = f", qwen_lr={optimizer.param_groups[1]['lr'] * lr_lambda(scheduler.last_epoch):.2e}" if text_encoder else ""
+        if (epoch + 1) % 10 == 0 or epoch == 0:
+            val_str = f", val={avg_val:.5f}" if not math.isnan(avg_val) else ""
+            print(f"Epoch {epoch+1:4d}: mse={avg_mse:.5f}, disc={avg_disc:.5f}{val_str}, lr={lr_now:.2e}{qwen_lr_str}")
+
+        # --- Visualization + checkpoint ---
+        if cfg.plot_every > 0 and ((epoch + 1) % cfg.plot_every == 0 or epoch == 0):
+            model.eval()
+            n_viz = min(4, len(sample_pairs)) if sample_pairs else 0
+            n_cols = n_viz + 1
+            fig, axes = plt.subplots(1, n_cols, figsize=(4 * n_cols, 4))
+            if n_cols == 1:
+                axes = [axes]
+
+            axes[0].plot(epoch_losses, linewidth=1.5, label="train MSE")
+            if val_losses:
+                axes[0].plot(val_losses, linewidth=1.5, linestyle="--", label="val MSE")
+            if disc_losses:
+                ax2 = axes[0].twinx()
+                ax2.plot(disc_losses, linewidth=1.2, color="coral", alpha=0.7, label="disc")
+                ax2.set_ylabel("Disc", fontsize=8, color="coral")
+                ax2.tick_params(axis='y', labelcolor='coral', labelsize=7)
+            axes[0].legend(fontsize=8)
+            axes[0].set_title("Loss")
+            axes[0].set_xlabel("Epoch")
+            axes[0].set_ylabel("Loss")
+            axes[0].grid(True, alpha=0.3)
+
+            if sample_pairs:
+                with torch.no_grad():
+                    for ax, pair in zip(axes[1:], sample_pairs[:n_viz]):
+                        dm = model.render_map(
+                            pair["avg_embedding"].to(device),
+                            H=cfg.target_resolution, W=cfg.target_width,
+                            device=device,
+                        )
+                        ax.imshow(dm, cmap="YlOrRd", origin="upper",
+                                  extent=[cfg.lon_min, cfg.lon_max,
+                                          cfg.lat_max, cfg.lat_min])
+                        ax.set_title(pair["class_name"], fontsize=9)
+                        ax.axis("off")
+
+            plt.suptitle(f"Epoch {epoch+1}", fontsize=11)
+            plt.tight_layout()
+            plt.savefig(viz_dir / f"epoch_{epoch+1:04d}.png", dpi=120)
+            plt.close(fig)
+
+            Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
+            ckpt_data = {
+                "epoch": epoch,
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "losses": epoch_losses,
+                "val_losses": val_losses,
+                "disc_losses": disc_losses,
+                "config": vars(cfg),
+            }
+            if text_encoder is not None:
+                te_module = text_encoder
+                ckpt_data["qwen_lora"] = {
+                    k: v for k, v in te_module._model.state_dict().items()
+                    if "lora" in k.lower()
+                }
+            torch.save(ckpt_data, ckpt_path)
+            print(f"  [ckpt] Saved → {ckpt_path}")
+            model.train()
+            if text_encoder is not None:
+                te_module = text_encoder
+                te_module.train()
+
+    return model
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def _cfg_hash(*parts) -> str:
+    blob = "|".join(str(p) for p in parts)
+    return hashlib.md5(blob.encode()).hexdigest()[:12]
+
+
+def main():
+    cfg = PipelineConfig()
+    cache_dir = Path(cfg.cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # --- Step 1: Load cached distributions ---
+    # (reuse your existing v1 cache — density maps haven't changed)
+    print("=" * 60)
+    print("STEP 1: Load distributions (from v1 cache)")
+    print("=" * 60)
+
+    dist_hash = _cfg_hash(
+        cfg.r3_dir, cfg.r4_dir, cfg.corine_geojson_path,
+        cfg.lat_min, cfg.lat_max, cfg.lon_min, cfg.lon_max,
+        cfg.target_resolution, cfg.min_pixels_for_class,
+    )
+    dist_cache = cache_dir / f"distributions_{dist_hash}.pkl"
+
+    if dist_cache.exists():
+        print(f"[cache] HIT → {dist_cache}")
+        with open(dist_cache, "rb") as f:
+            distributions = pickle.load(f)
+        print(f"  {len(distributions)} distribution maps")
+    else:
+        # If no cache, import and run v1 processing
+        from pipeline import process_all_rasters
+        distributions = process_all_rasters(cfg)
+        with open(dist_cache, "wb") as f:
+            pickle.dump(distributions, f)
+
+    # --- Step 2: Load cached pairs ---
+    print("\n" + "=" * 60)
+    print("STEP 2: Load text-paired training data")
+    print("=" * 60)
+
+    pairs_hash = _cfg_hash(
+        dist_hash, cfg.text_descriptions_path, cfg.hrl_descriptions_path,
+        cfg.text_emb_dim,
+    )
+    pairs_cache = cache_dir / f"pairs_{pairs_hash}.pt"
+
+    if pairs_cache.exists():
+        print(f"[cache] HIT → {pairs_cache}")
+        pairs = torch.load(pairs_cache, weights_only=False)
+        print(f"  {len(pairs)} pairs loaded")
+    else:
+        from full_flow import build_training_pairs
+        from fine_tune.qwen3_adapter import Qwen3EmbeddingAdapter
+        enc = Qwen3EmbeddingAdapter(target_dim=cfg.text_emb_dim, freeze_encoder=True)
+        enc = enc.to(device).eval()
+        pairs = build_training_pairs(
+            distributions, cfg.text_descriptions_path, enc,
+            extra_descriptions_paths=[cfg.hrl_descriptions_path],
+        )
+        del enc
+        torch.cuda.empty_cache()
+        torch.save(pairs, pairs_cache)
+
+    # --- Step 3: Load raw texts for on-the-fly encoding ---
+    raw_texts = None
+    text_encoder = None
+    if cfg.fine_tune_qwen:
+        print("\n" + "=" * 60)
+        print("STEP 3a: Load raw texts + Qwen with LoRA")
+        print("=" * 60)
+        raw_texts = load_raw_texts(
+            cfg.text_descriptions_path,
+            extra_paths=[cfg.hrl_descriptions_path],
+        )
+        print(f"  Loaded {len(raw_texts)} text descriptions")
+
+        from fine_tune.qwen3_adapter import Qwen3EmbeddingAdapter
+        qwen_device = "cuda:1" if torch.cuda.device_count() > 1 else device
+        text_encoder = Qwen3EmbeddingAdapter(
+            target_dim=cfg.text_emb_dim,
+            freeze_encoder=False,
+            lora=True,
+        ).to(qwen_device)
+        print(f"  Qwen on {qwen_device} (spatial model on {device})")
+
+    # --- Step 3b: Split and build GPU samplers ---
+    print("\n" + "=" * 60)
+    print("STEP 3b: Build GPU-native samplers (class-level split)")
+    print("=" * 60)
+
+    train_pairs, val_pairs = split_pairs_by_class(
+        pairs, val_fraction=cfg.val_class_fraction
+    )
+
+    train_sampler = GPUSampler(
+        train_pairs, cfg, device=device,
+        text_dropout=cfg.text_dropout,
+        raw_texts=raw_texts,
+    )
+    val_sampler = GPUSampler(
+        val_pairs, cfg, device=device,
+        text_dropout=0.0,
+    )
+    val_sampler.samples_per_epoch = cfg.val_samples
+    print(f"  Train: {train_sampler.samples_per_epoch:,} samples, {len(train_pairs)} classes")
+    print(f"  Val:   {val_sampler.samples_per_epoch:,} samples, {len(val_pairs)} classes")
+
+    # --- Step 4: Build and train model ---
+    print("\n" + "=" * 60)
+    print("STEP 4: Train SpatialBasisFieldV2")
+    print("=" * 60)
+
+    model = SpatialBasisFieldV2(
+        text_dim=cfg.text_emb_dim,
+        text_proj_dim=cfg.text_proj_dim,
+        n_bases=cfg.n_bases,
+        n_freqs=cfg.n_fourier_freqs,
+        hidden_dim=cfg.hidden_dim,
+        coord_hidden=cfg.coord_hidden,
+    )
+
+    model = train(model, train_sampler, cfg, device,
+                  sample_pairs=pairs, val_sampler=val_sampler,
+                  text_encoder=text_encoder)
+
+    # --- Step 5: Save ---
+    print("\n" + "=" * 60)
+    print("STEP 5: Save final model")
+    print("=" * 60)
+
+    out = Path(cfg.output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    save_data = {
+        "model_state_dict": model.state_dict(),
+        "config": vars(cfg),
+        "class_names": [p["class_name"] for p in pairs],
+    }
+    if text_encoder is not None:
+        te_module = text_encoder
+        save_data["qwen_lora"] = {
+            k: v for k, v in te_module._model.state_dict().items()
+            if "lora" in k.lower()
+        }
+    torch.save(save_data, out / "spatial_basis_field_v2.pt")
+    print(f"✅ Saved to {out / 'spatial_basis_field_v2.pt'}")
+
+
+if __name__ == "__main__":
+    main()
