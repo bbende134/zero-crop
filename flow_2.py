@@ -52,7 +52,7 @@ class PipelineConfig:
 
     # --- Model (reduced capacity vs v1) ---
     n_bases: int = 24
-    n_fourier_freqs: int = 32       # was 64 — less spatial memorization
+    n_fourier_freqs: int = 64       # restored to 64 for spatial resolution
     hidden_dim: int = 128            # was 256 — forces text reliance
     coord_hidden: int = 128          # trunk width
     text_emb_dim: int = 2560         # Qwen3 hidden dim
@@ -74,6 +74,11 @@ class PipelineConfig:
     plot_every: int = 20
     val_class_fraction: float = 0.2  # hold out this fraction of classes
     fine_tune_qwen: bool = True      # fine-tune Qwen embeddings with LoRA
+
+    # --- Qwen preconditioning (Stage 1) ---
+    pretrain_qwen_epochs: int = 10
+    pretrain_qwen_batch_size: int = 32
+    pretrain_qwen_lr: float = 1e-4
 
     @property
     def target_width(self):
@@ -218,8 +223,8 @@ class SpatialBasisFieldV2(nn.Module):
         basis_out = torch.einsum('bkd,kdo->bk', h_bases, self.basis_layer2_w) + self.basis_layer2_b.squeeze(-1)
         basis_out = torch.sigmoid(basis_out)                                   # (B, K)
 
-        # Weighted combination (mean, not sum — sum of 24 sigmoids saturates clamp)
-        density = (basis_out * factors).mean(dim=-1)  # (B,)
+        # Weighted combination
+        density = (basis_out * factors).sum(dim=-1)  # (B,)
         return density.clamp(0, 1)
 
     @torch.no_grad()
@@ -517,6 +522,113 @@ def split_pairs_by_class(pairs, val_fraction=0.2, seed=42):
     print(f"  Train classes: {len(train)}, Val classes: {len(val)}")
     print(f"  Val class names: {[p['class_name'] for p in val]}")
     return train, val
+
+
+def pretrain_qwen_classifier(text_encoder, raw_texts, pairs, cfg, device="cuda"):
+    """Stage 1: Pretrain Qwen LoRA via sentence → class classification.
+
+    Each sentence from the raw texts is treated as one input.
+    A temporary classification head maps the Qwen embedding (2560-d) to
+    N_classes logits, trained with cross-entropy.
+
+    After pretraining the classification head is discarded — only the
+    LoRA weights survive into Stage 2.
+    """
+    import random
+
+    # Build class mapping: desc_key → class_index
+    class_names = []
+    class_to_idx = {}
+    for p in pairs:
+        desc_key = p.get("desc_key", p["class_name"])
+        if desc_key not in class_to_idx:
+            class_to_idx[desc_key] = len(class_names)
+            class_names.append(desc_key)
+    n_classes = len(class_names)
+
+    # Build flat dataset: list of (sentence, class_index)
+    sentence_pool = []
+    for p in pairs:
+        desc_key = p.get("desc_key", p["class_name"])
+        cls_idx = class_to_idx[desc_key]
+        sents = raw_texts.get(desc_key, [f"{p['class_name']} in Hungary"])
+        for s in sents:
+            sentence_pool.append((s, cls_idx))
+
+    print(f"  Classification pretraining:")
+    print(f"    {n_classes} classes, {len(sentence_pool)} total sentences")
+    print(f"    Epochs: {cfg.pretrain_qwen_epochs}, batch_size: {cfg.pretrain_qwen_batch_size}")
+
+    # Temporary classification head (discarded after pretraining)
+    qwen_device = next(text_encoder.parameters()).device
+    cls_head = nn.Linear(cfg.text_emb_dim, n_classes).to(qwen_device)
+
+    # Optimizer: LoRA params + classification head
+    qwen_params = [p for p in text_encoder.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW([
+        {"params": qwen_params, "lr": cfg.pretrain_qwen_lr},
+        {"params": cls_head.parameters(), "lr": cfg.pretrain_qwen_lr * 10},
+    ])
+
+    total_steps = cfg.pretrain_qwen_epochs * (len(sentence_pool) // cfg.pretrain_qwen_batch_size + 1)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=1e-6)
+
+    tokenizer = text_encoder.tokenizer
+    text_encoder.train()
+
+    n_batches_per_epoch = len(sentence_pool) // cfg.pretrain_qwen_batch_size + 1
+
+    for epoch in tqdm(range(cfg.pretrain_qwen_epochs), desc="Stage 1", ncols=100):
+        random.shuffle(sentence_pool)
+        epoch_loss = 0.0
+        n_correct = 0
+        n_total = 0
+        n_batches = 0
+
+        pbar = tqdm(range(0, len(sentence_pool), cfg.pretrain_qwen_batch_size),
+                    desc=f"  Epoch {epoch+1:3d}", leave=False, ncols=120)
+        for i in pbar:
+            batch = sentence_pool[i:i + cfg.pretrain_qwen_batch_size]
+            texts = [s for s, _ in batch]
+            labels = torch.tensor([c for _, c in batch], dtype=torch.long, device=qwen_device)
+
+            # Tokenize and encode
+            inputs = tokenizer(
+                texts, return_tensors="pt",
+                truncation=True, max_length=512, padding=True,
+            )
+            input_ids = inputs["input_ids"].to(qwen_device)
+            attn_mask = inputs["attention_mask"].to(qwen_device)
+
+            with torch.autocast(qwen_device.type, dtype=torch.bfloat16):
+                embs = text_encoder(input_ids, attn_mask)  # (B, 2560)
+                logits = cls_head(embs)                     # (B, n_classes)
+                loss = F.cross_entropy(logits, labels)
+
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(qwen_params, 1.0)
+            optimizer.step()
+            scheduler.step()
+
+            epoch_loss += loss.item()
+            n_correct += (logits.argmax(dim=-1) == labels).sum().item()
+            n_total += len(labels)
+            n_batches += 1
+
+            pbar.set_postfix({
+                "loss": f"{epoch_loss/n_batches:.4f}",
+                "acc": f"{n_correct/max(1,n_total)*100:.1f}%",
+            })
+
+        acc = n_correct / max(1, n_total) * 100
+        avg_loss = epoch_loss / max(1, n_batches)
+
+    print(f"  ✅ Qwen preconditioning complete — {n_classes} classes, final acc={acc:.1f}%")
+
+    # Discard classification head, keep LoRA weights in text_encoder
+    del cls_head, optimizer, scheduler
+    torch.cuda.empty_cache()
 
 
 def train(model, train_sampler, cfg, device="cuda", sample_pairs=None,
@@ -883,6 +995,12 @@ def main():
         ).to(qwen_device)
         print(f"  Qwen on {qwen_device} (spatial model on {device})")
 
+        # --- Stage 1: Classification preconditioning ---
+        print("\n" + "=" * 60)
+        print("STAGE 1: Qwen classification preconditioning")
+        print("=" * 60)
+        pretrain_qwen_classifier(text_encoder, raw_texts, pairs, cfg, device=device)
+
     # --- Step 3b: Split and build GPU samplers ---
     print("\n" + "=" * 60)
     print("STEP 3b: Build GPU-native samplers (class-level split)")
@@ -907,7 +1025,7 @@ def main():
 
     # --- Step 4: Build and train model ---
     print("\n" + "=" * 60)
-    print("STEP 4: Train SpatialBasisFieldV2")
+    print("STAGE 2: Train SpatialBasisFieldV2")
     print("=" * 60)
 
     model = SpatialBasisFieldV2(

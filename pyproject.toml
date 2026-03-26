@@ -45,8 +45,15 @@ dependencies = [
 ]
 
 [tool.uv]
+# Research/Application mode (not a package)
+package = false
+managed = true
 # Restrict resolution to x86_64 Linux only (RTX 5090 machine)
 required-environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
 
 [tool.uv.sources]
 # Using PyTorch nightly with CUDA 12.8 for RTX 5090 (Blackwell sm_120) support

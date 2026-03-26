@@ -40,7 +40,7 @@ def inspect_tif(filepath, plot=False):
         print(f"Error reading {filepath}: {e}")
 
 def main():
-    base_dir = "/home/bende/dev/zero_crop/data_corine/Results-2"
+    base_dir = "/home/bende/dev/zero-crop/data_corine/Results-2"
     tif_files = glob.glob(os.path.join(base_dir, "**/*.tif"), recursive=True)
     
     print(f"Found {len(tif_files)} .tif files in {base_dir}")
