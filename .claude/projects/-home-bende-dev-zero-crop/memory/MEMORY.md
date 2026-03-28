@@ -1,0 +1,1 @@
+- [Always use uv run](feedback_uv_run.md) — never use bare python/python3, always uv run python
