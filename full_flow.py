@@ -477,7 +477,7 @@ def build_training_pairs(
                     chunks: List[str] = []
                     for article in texts.values():
                         sentences_raw = [s.strip() for s in article.replace("\n", " ").split(". ") if len(s.strip()) > 30]
-                        chunks.extend(sentences_raw[:10])
+                        chunks.extend(sentences_raw)
                     if chunks:
                         descriptions[key] = chunks
         else:

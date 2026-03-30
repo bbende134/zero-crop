@@ -31,43 +31,143 @@ Usage:
 """
 
 import argparse
+import math
 import sys
 from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
 import numpy as np
 import torch
+import torch.nn as nn
+
+
+# ---------------------------------------------------------------------------
+# Inline V1 architecture (pre-FiLM, coord_trunk style)
+# ---------------------------------------------------------------------------
+
+class _FourierFeatures(nn.Module):
+    def __init__(self, n_input=2, n_freqs=64, sigma=10.0):
+        super().__init__()
+        B = torch.randn(n_input, n_freqs) * sigma
+        self.register_buffer('B', B)
+
+    @property
+    def output_dim(self):
+        return 2 + 2 * self.B.shape[1]
+
+    def forward(self, coords):
+        proj = coords @ self.B
+        return torch.cat([coords, torch.sin(2 * math.pi * proj),
+                          torch.cos(2 * math.pi * proj)], dim=-1)
+
+
+class SpatialBasisFieldV1(nn.Module):
+    """Original (pre-FiLM) architecture: independent coord trunk + text factors."""
+
+    def __init__(self, text_dim=2560, n_bases=24, n_freqs=64, hidden_dim=256):
+        super().__init__()
+        self.n_bases = n_bases
+
+        self.text_to_factors = nn.Sequential(
+            nn.Linear(text_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, n_bases),
+        )
+
+        self.fourier = _FourierFeatures(n_input=2, n_freqs=n_freqs)
+        coord_dim = self.fourier.output_dim  # 2 + 2*n_freqs
+
+        self.coord_trunk = nn.Sequential(
+            nn.Linear(coord_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+        )
+
+        self.basis_heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim // 2),
+                nn.SiLU(),
+                nn.Linear(hidden_dim // 2, 1),
+            ) for _ in range(n_bases)
+        ])
+
+        self.basis_scale = nn.Parameter(torch.ones(n_bases))
+        self.basis_bias = nn.Parameter(torch.zeros(n_bases))
+
+    def forward(self, coords, text_emb):
+        factors = torch.sigmoid(self.text_to_factors(text_emb))          # (B, n_bases)
+        h = self.coord_trunk(self.fourier(coords))                        # (B, hidden)
+        basis_out = torch.cat([head(h) for head in self.basis_heads], -1) # (B, n_bases)
+        basis_out = torch.sigmoid(self.basis_scale * basis_out + self.basis_bias)
+        return (basis_out * factors).sum(dim=-1).clamp(0, 1)
+
+    @torch.no_grad()
+    def render_map(self, text_emb, H=256, W=480, device="cuda"):
+        self.eval()
+        lat_grid = torch.linspace(-1, 1, H, device=device)
+        lon_grid = torch.linspace(-1, 1, W, device=device)
+        grid_lat, grid_lon = torch.meshgrid(lat_grid, lon_grid, indexing='ij')
+        coords = torch.stack([grid_lat.flatten(), grid_lon.flatten()], dim=-1)
+        if text_emb.dim() == 1:
+            text_emb = text_emb.unsqueeze(0)
+        text_emb = text_emb.to(device)
+        text_expanded = text_emb.expand(coords.shape[0], -1)
+        parts = []
+        for i in range(0, len(coords), 100_000):
+            parts.append(self.forward(coords[i:i+100_000], text_expanded[i:i+100_000]))
+        return torch.cat(parts).view(H, W).cpu().numpy()
 
 
 def load_model(checkpoint_path: str, device: str = "cuda"):
-    """Load the SpatialBasisFieldV2 model from a checkpoint.
+    """Load a SpatialBasisField model from a checkpoint.
 
-    Handles both checkpoint formats:
+    Auto-detects V1 (coord_trunk) vs V2 (FiLM trunk) from the state dict keys.
+    Handles both save formats:
       - Final save: keys = model_state_dict, config, class_names, qwen_lora
       - Training checkpoint: keys = model, config, epoch, optimizer, ...
     """
-    from flow_2 import SpatialBasisFieldV2
-
     print(f"Loading checkpoint: {checkpoint_path}")
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
-    # Extract config
     cfg = ckpt.get("config", {})
-    print(f"  Config: n_bases={cfg.get('n_bases')}, n_fourier_freqs={cfg.get('n_fourier_freqs')}, "
-          f"hidden_dim={cfg.get('hidden_dim')}, text_emb_dim={cfg.get('text_emb_dim')}")
+    state_dict = ckpt.get("model_state_dict") or ckpt.get("model", {})
 
-    # Build model with saved config
-    model = SpatialBasisFieldV2(
-        text_dim=cfg.get("text_emb_dim", 2560),
-        text_proj_dim=cfg.get("text_proj_dim", 128),
-        n_bases=cfg.get("n_bases", 24),
-        n_freqs=cfg.get("n_fourier_freqs", 32),
-        hidden_dim=cfg.get("hidden_dim", 128),
-        coord_hidden=cfg.get("coord_hidden", 128),
-    )
+    # Detect architecture from state dict keys
+    is_v1 = "coord_trunk.0.weight" in state_dict
+
+    if is_v1:
+        # Infer dims from weights
+        n_freqs = state_dict["fourier.B"].shape[1]
+        n_bases = state_dict["basis_scale"].shape[0]
+        hidden_dim = state_dict["coord_trunk.0.weight"].shape[0]
+        text_dim = state_dict["text_to_factors.0.weight"].shape[1]
+        print(f"  Detected V1 architecture: text_dim={text_dim}, n_bases={n_bases}, "
+              f"n_freqs={n_freqs}, hidden_dim={hidden_dim}")
+        model = SpatialBasisFieldV1(
+            text_dim=text_dim, n_bases=n_bases, n_freqs=n_freqs, hidden_dim=hidden_dim,
+        )
+    else:
+        from flow_2 import SpatialBasisFieldV2
+        # Infer text_proj_dim from weights if absent from config
+        if "text_proj_dim" not in cfg and "text_to_factors.0.weight" in state_dict:
+            cfg["text_proj_dim"] = state_dict["text_to_factors.0.weight"].shape[1]
+        print(f"  Detected V2 architecture: n_bases={cfg.get('n_bases')}, "
+              f"n_fourier_freqs={cfg.get('n_fourier_freqs')}, hidden_dim={cfg.get('hidden_dim')}, "
+              f"text_emb_dim={cfg.get('text_emb_dim')}, text_proj_dim={cfg.get('text_proj_dim')}")
+        model = SpatialBasisFieldV2(
+            text_dim=cfg.get("text_emb_dim", 2560),
+            text_proj_dim=cfg.get("text_proj_dim", 128),
+            n_bases=cfg.get("n_bases", 24),
+            n_freqs=cfg.get("n_fourier_freqs", 32),
+            hidden_dim=cfg.get("hidden_dim", 128),
+            coord_hidden=cfg.get("coord_hidden", 128),
+        )
 
     # Load weights (handle both key names)
     if "model_state_dict" in ckpt:

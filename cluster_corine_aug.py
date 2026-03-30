@@ -8,11 +8,17 @@ if os.path.isdir(_cu13) and _cu13 not in os.environ.get("LD_LIBRARY_PATH", ""):
 del _cu13
 
 """
-Cluster CORINE wiki sentences using Qwen3.5-4B embeddings.
+Cluster CORINE wiki sentences with augmented context using Qwen3.5-4B (fine-tuned).
 
-Reads data_corine/corine_wiki_char_count.jsonl, embeds each sentence
-via last-token pooling from Qwen3.5-4B, then clusters with KMeans.
-Saves results + a 2D UMAP visualization.
+Each sentence is embedded with up to 5 sentences of surrounding context from
+the same document (same code+term), giving the model local discourse context.
+The embedding represents the target sentence; the context only shapes how it
+is read.
+
+Format fed to encoder:
+  "<ctx_before> <TARGET: sentence> <ctx_after>"
+
+Saves results to data_corine/clusters/ with _aug suffix.
 """
 
 import json
@@ -21,6 +27,8 @@ import torch
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
+
+CONTEXT_WINDOW = 5  # sentences on each side
 
 # ── 1. Load & sentence-split ──────────────────────────────────────────
 
@@ -31,30 +39,39 @@ with open(DATA_PATH) as f:
     for line in f:
         records.append(json.loads(line))
 
-# Sentence-split each wiki text, keeping provenance
 SENT_RE = re.compile(r'(?<=[.!?])\s+')
 
-sentences = []   # list of str
+sentences = []   # bare target sentences (for saving)
+aug_texts = []   # context-augmented inputs (for embedding)
 meta = []        # list of dict(code, term, sent_idx)
 
 for rec in records:
     code = rec["code"]
     for term, text in rec["wiki_texts"].items():
-        sents = [s.strip() for s in SENT_RE.split(text) if len(s.strip()) > 30]
-        for i, s in enumerate(sents):
-            # Truncate very long "sentences" (probably parsing artefacts)
-            sentences.append(s[:512])
+        doc_sents = [s.strip() for s in SENT_RE.split(text) if len(s.strip()) > 30]
+        doc_sents = [s[:512] for s in doc_sents]
+
+        for i, s in enumerate(doc_sents):
+            ctx_before = doc_sents[max(0, i - CONTEXT_WINDOW):i]
+            ctx_after  = doc_sents[i + 1: i + 1 + CONTEXT_WINDOW]
+
+            # Build augmented input: context + target marker + context
+            parts = ctx_before + [f"TARGET: {s}"] + ctx_after
+            aug = " ".join(parts)
+
+            sentences.append(s)
+            aug_texts.append(aug[:1024])  # encoder truncates at 512 tokens anyway
             meta.append({"code": code, "term": term, "sent_idx": i})
 
 print(f"Total sentences: {len(sentences)}")
 
-# ── 2. Embed with Qwen3.5-4B (or load cached) ────────────────────────
+# ── 2. Embed with fine-tuned Qwen3.5-4B (or load cached) ─────────────
 
 OUT_DIR = Path("data_corine/clusters")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-EMB_CACHE = OUT_DIR / "embeddings_finetuned.npy"
-META_CACHE = OUT_DIR / "meta_finetuned.jsonl"
+EMB_CACHE  = OUT_DIR / "embeddings_aug.npy"
+META_CACHE = OUT_DIR / "meta_aug.jsonl"
 
 FINETUNED_LORA_PATH = Path("training_data/qwen_lora_finetuned.pt")
 
@@ -71,20 +88,19 @@ else:
     if FINETUNED_LORA_PATH.exists():
         print(f"Loading fine-tuned LoRA weights from {FINETUNED_LORA_PATH}")
         ckpt = torch.load(FINETUNED_LORA_PATH, map_location=device, weights_only=False)
-        lora_state = ckpt["lora_state_dict"]
-        missing, unexpected = encoder._model.load_state_dict(lora_state, strict=False)
+        missing, unexpected = encoder._model.load_state_dict(ckpt["lora_state_dict"], strict=False)
         print(f"  Loaded LoRA weights (missing={len(missing)}, unexpected={len(unexpected)})")
     else:
         print(f"WARNING: Fine-tuned checkpoint not found at {FINETUNED_LORA_PATH}, using base model")
 
     encoder.eval()
 
-    BATCH = 32
+    BATCH = 16  # smaller batch — augmented texts are longer
     emb_list = []
 
-    print("Encoding sentences...")
-    for i in tqdm(range(0, len(sentences), BATCH)):
-        batch = sentences[i : i + BATCH]
+    print("Encoding augmented sentences...")
+    for i in tqdm(range(0, len(aug_texts), BATCH)):
+        batch = aug_texts[i : i + BATCH]
         with torch.no_grad():
             emb = encoder.encode_batch(batch, chunk_size=BATCH, normalize=True)
         emb_list.append(emb.cpu().float())
@@ -95,11 +111,12 @@ else:
     np.save(EMB_CACHE, embeddings)
     with open(META_CACHE, "w") as f:
         for i, m in enumerate(meta):
-            f.write(json.dumps({**m, "sentence": sentences[i]}, ensure_ascii=False) + "\n")
+            f.write(json.dumps({**m, "sentence": sentences[i], "aug_text": aug_texts[i]},
+                               ensure_ascii=False) + "\n")
     print(f"Saved embeddings to {EMB_CACHE}")
     print(f"Saved metadata to {META_CACHE}")
 
-# ── 3. Cluster with KMeans ────────────────────────────────────────────
+# ── 3. Cluster ────────────────────────────────────────────────────────
 
 from sklearn.cluster import KMeans, OPTICS
 from sklearn.metrics import silhouette_score
@@ -107,7 +124,7 @@ import hdbscan
 
 # ── 3a. KMeans ────────────────────────────────────────────────────────
 
-N_CLUSTERS = 44  # same as number of CORINE classes
+N_CLUSTERS = 44
 
 print(f"\n--- KMeans (k={N_CLUSTERS}) ---")
 km = KMeans(n_clusters=N_CLUSTERS, n_init=10, random_state=42, verbose=0)
@@ -147,7 +164,7 @@ if n_opt > 1:
 else:
     sil_opt = -1.0
 
-# ── 4. Save results ──────────────────────────────────────────────────
+# ── 4. Save results ───────────────────────────────────────────────────
 
 def save_clustering(labels, name, sil):
     results = []
@@ -159,7 +176,7 @@ def save_clustering(labels, name, sil):
             "sent_idx": m["sent_idx"],
             "sentence": sent,
         })
-    with open(OUT_DIR / f"clustered_{name}_finetuned.jsonl", "w") as f:
+    with open(OUT_DIR / f"clustered_{name}_aug.jsonl", "w") as f:
         for r in results:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
@@ -171,7 +188,7 @@ def save_clustering(labels, name, sil):
         cluster_summary[cid]["codes"].add(r["code"])
         cluster_summary[cid]["terms"].add(r["term"])
         cluster_summary[cid]["count"] += 1
-    with open(OUT_DIR / f"summary_{name}_finetuned.json", "w") as f:
+    with open(OUT_DIR / f"summary_{name}_aug.json", "w") as f:
         summary_out = {
             str(k): {
                 "count": v["count"],
@@ -187,22 +204,19 @@ save_clustering(labels_km, "kmeans", sil_km)
 save_clustering(labels_hdb, "hdbscan", sil_hdb)
 save_clustering(labels_opt, "optics", sil_opt)
 
-# Save all label arrays as .npy for easy reloading
-np.save(OUT_DIR / "labels_kmeans_finetuned.npy", labels_km)
-np.save(OUT_DIR / "labels_hdbscan_finetuned.npy", labels_hdb)
-np.save(OUT_DIR / "labels_optics_finetuned.npy", labels_opt)
-
-# Save fitted cluster objects via pickle for later inspection
 import pickle
-with open(OUT_DIR / "kmeans_model_finetuned.pkl", "wb") as f:
+np.save(OUT_DIR / "labels_kmeans_aug.npy", labels_km)
+np.save(OUT_DIR / "labels_hdbscan_aug.npy", labels_hdb)
+np.save(OUT_DIR / "labels_optics_aug.npy", labels_opt)
+with open(OUT_DIR / "kmeans_model_aug.pkl", "wb") as f:
     pickle.dump(km, f)
-with open(OUT_DIR / "hdbscan_model_finetuned.pkl", "wb") as f:
+with open(OUT_DIR / "hdbscan_model_aug.pkl", "wb") as f:
     pickle.dump(hdb, f)
-with open(OUT_DIR / "optics_model_finetuned.pkl", "wb") as f:
+with open(OUT_DIR / "optics_model_aug.pkl", "wb") as f:
     pickle.dump(optics, f)
 print(f"Saved all label arrays and fitted models to {OUT_DIR}/")
 
-# ── 5. PCA visualization (all 3 methods) ─────────────────────────────
+# ── 5. PCA visualization ──────────────────────────────────────────────
 
 from sklearn.decomposition import PCA
 import matplotlib
@@ -212,7 +226,7 @@ import matplotlib.pyplot as plt
 print("\nComputing PCA for 2D projection...")
 pca = PCA(n_components=2, random_state=42)
 coords = pca.fit_transform(embeddings)
-np.save(OUT_DIR / "pca_coords_finetuned.npy", coords)
+np.save(OUT_DIR / "pca_coords_aug.npy", coords)
 
 fig, axes = plt.subplots(1, 3, figsize=(20, 6))
 for ax, (labels, name, sil) in zip(axes, [
@@ -229,9 +243,12 @@ for ax, (labels, name, sil) in zip(axes, [
     ax.set_ylabel("PC2")
     plt.colorbar(scatter, ax=ax, shrink=0.8)
 
-plt.suptitle("CORINE wiki sentences — Qwen3.5-4B fine-tuned embeddings", fontsize=14, fontweight="bold")
+plt.suptitle(
+    f"CORINE wiki sentences — Qwen3.5-4B fine-tuned, ±{CONTEXT_WINDOW}-sentence context",
+    fontsize=14, fontweight="bold",
+)
 plt.tight_layout()
-plt.savefig(OUT_DIR / "clusters_comparison_finetuned.png", dpi=150)
-print(f"Saved comparison plot to {OUT_DIR / 'clusters_comparison_finetuned.png'}")
+plt.savefig(OUT_DIR / "clusters_comparison_aug.png", dpi=150)
+print(f"Saved comparison plot to {OUT_DIR / 'clusters_comparison_aug.png'}")
 
 print("\nDone!")

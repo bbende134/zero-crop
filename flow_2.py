@@ -74,6 +74,8 @@ class PipelineConfig:
     plot_every: int = 20
     val_class_fraction: float = 0.2  # hold out this fraction of classes
     fine_tune_qwen: bool = True      # fine-tune Qwen embeddings with LoRA
+    filter_text_relevance: bool = True  # filter Wikipedia text for visual/geographic relevance
+    disc_max_pairs: int = 40            # max discrimination loss pairs (was 10)
 
     # --- Qwen preconditioning (Stage 1) ---
     pretrain_qwen_epochs: int = 10
@@ -273,7 +275,43 @@ class SpatialBasisFieldV2(nn.Module):
         return maps
 
 
-def load_raw_texts(descriptions_path, extra_paths=None):
+_KEEP_PATTERNS = [
+    "grow", "cultivat", "soil", "climate", "vegetation", "habitat",
+    "landscape", "region", "area", "found in", "distribut", "elevation",
+    "temperate", "continental", "plain", "lowland", "forest", "field",
+    "crop", "leaf", "canopy", "flower", "root", "seed", "harvest",
+    "irrigat", "rainfall", "drought", "fertile", "arid", "humid",
+    "grassland", "meadow", "pasture", "woodland", "shrub", "wetland",
+    "river", "lake", "marsh", "peat", "sand", "clay", "loam",
+    "plant", "tree", "herb", "annual", "perennial", "deciduous",
+    "satellite", "reflectance", "spectral", "surface", "cover",
+    "land use", "agricultural", "urban", "industrial", "residential",
+    "water", "pond", "reservoir", "stream", "floodplain",
+    "hungary", "pannonian", "carpathian", "danube", "tisza",
+]
+_DROP_PATTERNS = [
+    "born", "died", "century", "recipe", "cuisine", "cooking",
+    "export", "import", "million tonnes", "gdp", "economy",
+    "kingdom", "phylum", "genus", "family poaceae",
+    "isbn", "doi.org", "issn", "archived from",
+    "football", "stadium", "championship", "olympic",
+    "album", "song", "film", "movie", "novel", "author",
+]
+
+
+def filter_relevant_sentences(sentences: List[str]) -> List[str]:
+    """Keep sentences about physical appearance, geography, agriculture, ecology."""
+    filtered = []
+    for s in sentences:
+        s_lower = s.lower()
+        if any(drop in s_lower for drop in _DROP_PATTERNS):
+            continue
+        if any(keep in s_lower for keep in _KEEP_PATTERNS):
+            filtered.append(s)
+    return filtered
+
+
+def load_raw_texts(descriptions_path, extra_paths=None, filter_relevance=True):
     """Load raw text sentences from JSONL files. Returns {desc_key: [sentences]}."""
     descriptions = {}
 
@@ -290,13 +328,34 @@ def load_raw_texts(descriptions_path, extra_paths=None):
                     chunks = []
                     for article in texts.values():
                         sents = [s.strip() for s in article.replace("\n", " ").split(". ") if len(s.strip()) > 30]
-                        chunks.extend(sents[:10])
+                        if filter_relevance:
+                            relevant = filter_relevant_sentences(sents)
+                            chunks.extend(relevant if relevant else sents)
+                        else:
+                            chunks.extend(sents)
                     if chunks:
                         descriptions[key] = chunks
 
     _load(descriptions_path)
     for extra in (extra_paths or []):
         _load(extra)
+
+    # Minimum enrichment: ensure every class has at least 3 sentences
+    for key, sents in list(descriptions.items()):
+        if len(sents) < 3:
+            class_label = key.replace("_", " ")
+            descriptions[key].extend([
+                f"Land cover characterized by {class_label}",
+                f"Areas of {class_label} as observed from satellite imagery",
+                f"Spatial distribution of {class_label} in Hungary",
+            ])
+
+    if filter_relevance:
+        total = sum(len(v) for v in descriptions.values())
+        print(f"  Text filtering: {len(descriptions)} classes, {total} total sentences")
+        for key, sents in sorted(descriptions.items(), key=lambda x: len(x[1])):
+            print(f"    {key:30s}: {len(sents):4d} sentences")
+
     return descriptions
 
 
@@ -360,9 +419,16 @@ class GPUSampler:
                 sents = raw_texts.get(desc_key, [f"{p['class_name']} in Hungary"])
                 self.raw_sentences.append(sents)
 
+        # Per-class inverse-frequency weights for balanced loss
+        pixel_masses = self.density_maps.sum(dim=(1, 2))  # (n_maps,)
+        inv_freq = 1.0 / torch.sqrt(pixel_masses + 1e-6)
+        self.class_weights = (inv_freq / inv_freq.mean()).to(device)  # normalized, mean=1
+
         print(f"  GPUSampler: {self.n_maps} maps, {H}x{W}, "
               f"{max_sents} max sents, "
               f"raw_texts={'yes' if self.raw_sentences else 'no'}")
+        print(f"  Class weights (min={self.class_weights.min():.3f}, "
+              f"max={self.class_weights.max():.3f}, mean={self.class_weights.mean():.3f})")
 
     def __len__(self):
         return self.samples_per_epoch
@@ -467,7 +533,7 @@ def compute_discrimination_loss(model, coords, text_embs, map_indices, n_coords=
 
     # Cap the number of class pairs to avoid blowup with many classes
     class_list = unique_maps.tolist()
-    max_pairs = 10
+    max_pairs = 40
     if n_classes * (n_classes - 1) // 2 > max_pairs:
         # Random subset of pairs
         import itertools
@@ -769,8 +835,9 @@ def train(model, train_sampler, cfg, device="cuda", sample_pairs=None,
             # --- Forward with AMP ---
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 preds = model(coords, text_embs)
-                weights = 1.0 + 4.0 * targets
-                mse_loss = (weights * (preds - targets) ** 2).mean()
+                class_w = train_sampler.class_weights[map_indices]
+                signal_w = 1.0 + 4.0 * targets
+                mse_loss = (class_w * signal_w * (preds - targets) ** 2).mean()
 
                 disc_loss = compute_discrimination_loss(
                     model, coords, text_embs, map_indices, n_coords=32
@@ -819,10 +886,11 @@ def train(model, train_sampler, cfg, device="cuda", sample_pairs=None,
             n_val_batches = val_sampler.n_batches
             with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
                 for _ in range(n_val_batches):
-                    c, t, tgt, _ = val_sampler.sample_batch()
+                    c, t, tgt, mi = val_sampler.sample_batch()
                     p = model(c, t)
-                    w = 1.0 + 4.0 * tgt
-                    val_sum += (w * (p - tgt) ** 2).mean().item()
+                    cw = val_sampler.class_weights[mi]
+                    sw = 1.0 + 4.0 * tgt
+                    val_sum += (cw * sw * (p - tgt) ** 2).mean().item()
             avg_val = val_sum / max(1, n_val_batches)
             val_losses.append(avg_val)
             model.train()
@@ -983,6 +1051,7 @@ def main():
         raw_texts = load_raw_texts(
             cfg.text_descriptions_path,
             extra_paths=[cfg.hrl_descriptions_path],
+            filter_relevance=cfg.filter_text_relevance,
         )
         print(f"  Loaded {len(raw_texts)} text descriptions")
 

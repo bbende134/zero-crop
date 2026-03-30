@@ -40,6 +40,10 @@ dependencies = [
     "pymilvus>=2.6.3",
     "peft>=0.13.2",
     "hdbscan>=0.8.40",
+    "torch>=2.11.0",
+    "torchvision>=0.26.0",
+    "umap-learn>=0.5.11",
+    "scienceplots>=2.2.1",
 ]
 
 [tool.uv]
