@@ -50,37 +50,43 @@ class PipelineConfig:
     target_resolution: int = 256
     min_pixels_for_class: int = 500
 
-    # --- Model (reduced capacity vs v1) ---
+    # --- Satellite embeddings (AlphaEarth) ---
+    sat_emb_path: str = "data_corine/embedding_inspection/embeddings_with_corine_old.parquet"
+    sat_emb_dim: int = 64
+    n_sat_augments: int = 16        # sub-centroid augmentations per class
+
+    # --- Model ---
     n_bases: int = 24
-    n_fourier_freqs: int = 64       # restored to 64 for spatial resolution
-    hidden_dim: int = 128            # was 256 — forces text reliance
-    coord_hidden: int = 128          # trunk width
-    text_emb_dim: int = 2560         # Qwen3 hidden dim
-    text_proj_dim: int = 128         # project text down before FiLM
+    n_fourier_freqs: int = 64
+    hidden_dim: int = 128
+    coord_hidden: int = 128
+    text_emb_dim: int = 64          # satellite embedding dim (was 2560 Qwen)
+    text_proj_dim: int = 64         # project sat emb before FiLM
+
+    # --- TextToSatBridge (text → satellite space projection) ---
+    bridge_hidden_dim: int = 256
+    bridge_weight: float = 1.0      # weight on alignment loss
+    bridge_start_epoch: int = 50    # epoch to start mixing text path
+    text_mix_ratio: float = 0.3     # fraction of batches using bridge conditioning
+    bridge_lr: float = 1e-4
+
+    # --- Qwen (frozen, used only for bridge training) ---
+    qwen_emb_dim: int = 2560        # Qwen3 hidden dim — bridge input
 
     # --- Training ---
     n_epochs: int = 400
     lr: float = 3e-4
-    qwen_lr: float = 3e-5            # 10x lower LR for Qwen LoRA
     batch_size: int = 65_536
-    qwen_batch_size: int = 16         # max texts per Qwen forward (grad checkpoint saves memory)
     samples_per_epoch: int = 2_000_000
     val_samples: int = 100_000
     weight_decay: float = 1e-5
-    text_dropout: float = 0.1        # fraction of samples with zeroed text
+    text_dropout: float = 0.1        # fraction of samples with zeroed sat embedding
     discrimination_weight: float = 0.5
-    disc_warmup_epochs: int = 50     # disc weight = 0 for this many epochs, then ramp up
-    disc_ramp_epochs: int = 50       # ramp from 0 → full weight over this many epochs
+    disc_warmup_epochs: int = 50
+    disc_ramp_epochs: int = 50
     plot_every: int = 20
-    val_class_fraction: float = 0.2  # hold out this fraction of classes
-    fine_tune_qwen: bool = True      # fine-tune Qwen embeddings with LoRA
-    filter_text_relevance: bool = True  # filter Wikipedia text for visual/geographic relevance
-    disc_max_pairs: int = 40            # max discrimination loss pairs (was 10)
-
-    # --- Qwen preconditioning (Stage 1) ---
-    pretrain_qwen_epochs: int = 10
-    pretrain_qwen_batch_size: int = 32
-    pretrain_qwen_lr: float = 1e-4
+    val_class_fraction: float = 0.2
+    disc_max_pairs: int = 40
 
     @property
     def target_width(self):
@@ -131,6 +137,28 @@ class FiLMLayer(nn.Module):
         h = self.linear(x)
         gamma, beta = self.film(cond).chunk(2, dim=-1)
         return F.silu(gamma * h + beta)
+
+
+class TextToSatBridge(nn.Module):
+    """Projects Qwen text embedding → satellite embedding space (L2-normalized).
+
+    Trained alongside the spatial model via a cosine alignment loss against
+    per-class AlphaEarth satellite centroids.  At inference any free-text
+    query is routed through Qwen (frozen) → this bridge → spatial model.
+    """
+
+    def __init__(self, text_dim: int = 2560, sat_dim: int = 64,
+                 hidden_dim: int = 256):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.LayerNorm(text_dim),
+            nn.Linear(text_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, sat_dim),
+        )
+
+    def forward(self, text_emb):
+        return F.normalize(self.proj(text_emb), dim=-1)
 
 
 class SpatialBasisFieldV2(nn.Module):
@@ -194,7 +222,10 @@ class SpatialBasisFieldV2(nn.Module):
         self.basis_hidden_dim = hidden_dim // 2
         self.basis_layer1 = nn.Linear(coord_hidden, n_bases * self.basis_hidden_dim)
         self.basis_layer2_w = nn.Parameter(torch.randn(n_bases, self.basis_hidden_dim, 1) * 0.02)
-        self.basis_layer2_b = nn.Parameter(torch.zeros(n_bases, 1))
+        # Init bias to -4: sigmoid(-4)≈0.018 per basis.
+        # Initial density = n_bases * sigmoid(0) * 0.018 ≈ 0.22 — well below 1.0 so
+        # gradients flow freely through the clamp from the first batch.
+        self.basis_layer2_b = nn.Parameter(torch.full((n_bases, 1), -4.0))
 
     def _get_text_cond(self, text_emb):
         """Project text to conditioning vector."""
@@ -360,6 +391,352 @@ def load_raw_texts(descriptions_path, extra_paths=None, filter_relevance=True):
 
 
 # ============================================================
+# SATELLITE EMBEDDING UTILITIES
+# ============================================================
+
+# Maps HRL crop class desc_keys to CORINE Code_18 for satellite centroid lookup.
+# All arable crop types → 211 (non-irrigated arable land);
+# grapes → 221; permanent crops → 222; grassland → 231.
+_HRL_TO_CORINE: Dict[str, str] = {
+    "wheat": "211", "barley": "211", "maize": "211", "rice": "213",
+    "other_cereals": "211", "fresh_vegetables": "211", "dry_pulses": "211",
+    "potatoes": "211", "sugar_beet": "211", "sunflower": "211",
+    "soybeans": "211", "rapeseed": "211", "flax_cotton_hemp": "211",
+    "grapes": "221", "olives": "222", "fruits": "222", "nuts": "222",
+    "unclassified_arable": "211", "unclassified_permanent": "231",
+    "main_crop_harvest_date": "211", "permanent_grassland": "231",
+    "bare_soil_before_sowing": "211", "bare_soil_after_harvest": "211",
+}
+
+
+def _fetch_milvus_tile(lat0: float, lat1: float, lon0: float, lon1: float,
+                       host: str = "192.168.242.182", port: str = "19530",
+                       collection: str = "high_res_hun_2018",
+                       emb_field: str = "vector",
+                       page_size: int = 16384) -> List[dict]:
+    """Fetch all embeddings in a lat/lon tile via iterative offset pagination."""
+    from pymilvus import Collection, connections
+    alias = f"satcent_{lat0:.3f}_{lon0:.3f}_{id(object())}"
+    try:
+        connections.connect(alias=alias, host=host, port=port)
+        coll = Collection(collection, using=alias)
+        coll.load()
+        expr = (f"lat >= {lat0} && lat < {lat1} && "
+                f"lon >= {lon0} && lon < {lon1}")
+        rows = []
+        offset = 0
+        while True:
+            batch = coll.query(
+                expr=expr, output_fields=[emb_field, "lat", "lon"],
+                limit=page_size, offset=offset,
+            )
+            rows.extend(batch)
+            if len(batch) < page_size:
+                break
+            offset += page_size
+        connections.disconnect(alias)
+        return rows
+    except Exception as e:
+        print(f"  Tile ({lat0:.2f},{lon0:.2f}) failed: {e}")
+        return []
+
+
+def _fetch_milvus_with_corine_join(cfg: "PipelineConfig") -> "pd.DataFrame":
+    """Fetch all embeddings from Milvus and spatial-join with CORINE polygons.
+
+    Tiles Hungary into 0.05° cells, fetches with offset pagination per tile,
+    then assigns Code_18 via a geopandas point-in-polygon join.
+    Caches the result to data_corine/embedding_inspection/embeddings_with_corine.parquet.
+    """
+    import geopandas as gpd
+    import pandas as pd
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from shapely.geometry import box
+
+    cache = Path("data_corine/embedding_inspection/embeddings_with_corine.parquet")
+    if cache.exists():
+        print(f"  [cache] Spatial-join parquet found → {cache}")
+        return pd.read_parquet(cache)
+
+    # Load CORINE polygons clipped to Hungary
+    print(f"  Loading CORINE polygons for spatial join...")
+    gdf = gpd.read_file(cfg.corine_geojson_path)
+    if gdf.crs is None:
+        gdf = gdf.set_crs("EPSG:4326")
+    hungary = box(cfg.lon_min, cfg.lat_min, cfg.lon_max, cfg.lat_max)
+    gdf = gdf[gdf.geometry.intersects(hungary)][["Code_18", "geometry"]].copy()
+    gdf["Code_18"] = gdf["Code_18"].astype(str)
+    print(f"  {len(gdf)} CORINE features, {gdf['Code_18'].nunique()} classes")
+
+    # Tile Hungary
+    tile_size = 0.05
+    lat_edges = np.arange(cfg.lat_min, cfg.lat_max + tile_size, tile_size)
+    lon_edges = np.arange(cfg.lon_min, cfg.lon_max + tile_size, tile_size)
+    tiles = [
+        (lat_edges[i], lat_edges[i + 1], lon_edges[j], lon_edges[j + 1])
+        for i in range(len(lat_edges) - 1)
+        for j in range(len(lon_edges) - 1)
+    ]
+    print(f"  Fetching {len(tiles)} tiles from Milvus high_res_hun_2018 (~25M rows)...")
+
+    all_rows: List[dict] = []
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(_fetch_milvus_tile, *t): t for t in tiles}
+        for fut in tqdm(as_completed(futures), total=len(futures), desc="Milvus tiles"):
+            for r in fut.result():
+                vec = r["vector"]
+                row: dict = {"lat": r["lat"], "lon": r["lon"]}
+                for d, v in enumerate(vec):
+                    row[f"v{d}"] = float(v)
+                all_rows.append(row)
+
+    df = pd.DataFrame(all_rows)
+    print(f"  Fetched {len(df):,} embeddings — running spatial join...")
+
+    emb_gdf = gpd.GeoDataFrame(
+        df, geometry=gpd.points_from_xy(df["lon"], df["lat"]), crs="EPSG:4326"
+    )
+    joined = gpd.sjoin(emb_gdf, gdf, how="left", predicate="within")
+    joined = joined.dropna(subset=["Code_18"])
+    result = joined.drop(columns=["geometry", "index_right"], errors="ignore")
+
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    result.to_parquet(cache, index=False)
+    print(f"  Cached {len(result):,} joined embeddings → {cache}")
+    return result
+
+
+def build_class_satellite_embeddings(cfg: "PipelineConfig",
+                                     cache_dir: Path) -> dict:
+    """Build per-class L2-normalized satellite centroids from high_res_hun_2018.
+
+    Returns a dict with two keys:
+      "centroids":  {code18: np.ndarray(64,)}
+      "augmented":  {code18: np.ndarray(K, 64)}  — K=cfg.n_sat_augments sub-centroids
+    """
+    import hashlib
+    import pandas as pd
+
+    cache_key = hashlib.md5(
+        f"sat_centroids|{cfg.n_sat_augments}".encode()
+    ).hexdigest()[:12]
+    cache_path = cache_dir / f"sat_centroids_{cache_key}.pt"
+
+    if cache_path.exists():
+        print(f"[cache] HIT → {cache_path}")
+        return torch.load(cache_path, weights_only=False)
+
+    # Load embedding + CORINE data
+    old_parquet = Path(cfg.sat_emb_path)
+    if old_parquet.exists():
+        print(f"  Loading existing parquet: {old_parquet}")
+        df = pd.read_parquet(old_parquet)
+    else:
+        df = _fetch_milvus_with_corine_join(cfg)
+
+    emb_cols = [f"v{i}" for i in range(cfg.sat_emb_dim)]
+    missing = [c for c in emb_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"Parquet missing embedding columns: {missing[:3]}...")
+
+    print(f"  Computing centroids for {df['Code_18'].nunique()} classes "
+          f"from {len(df):,} embeddings...")
+
+    rng = np.random.RandomState(42)
+    centroids: Dict[str, np.ndarray] = {}
+    augmented: Dict[str, np.ndarray] = {}
+
+    for code, group in df.groupby("Code_18"):
+        vecs = group[emb_cols].values.astype(np.float32)
+        c = vecs.mean(axis=0)
+        c /= np.linalg.norm(c) + 1e-8
+        centroids[str(code)] = c
+
+        K = cfg.n_sat_augments
+        n = len(vecs)
+        sub_size = max(1, n // 2)
+        augs = []
+        for _ in range(K):
+            idx = rng.choice(n, size=min(n, sub_size), replace=False)
+            sub = vecs[idx].mean(axis=0)
+            sub /= np.linalg.norm(sub) + 1e-8
+            augs.append(sub)
+        augmented[str(code)] = np.stack(augs)
+
+    result = {"centroids": centroids, "augmented": augmented}
+    torch.save(result, cache_path)
+    print(f"  {len(centroids)} centroids built → {cache_path}")
+    return result
+
+
+def build_satellite_pairs(pairs: List[dict], sat_data: dict) -> List[dict]:
+    """Enrich training pairs with satellite conditioning embeddings.
+
+    Replaces avg_embedding / sentence_embeddings with AlphaEarth satellite
+    centroids, and saves the original Qwen embeddings as qwen_avg_embedding /
+    qwen_sentence_embeddings for use by the TextToSatBridge during training.
+    """
+    centroids = sat_data["centroids"]
+    augmented = sat_data["augmented"]
+
+    # Global fallback centroid
+    all_c = np.stack(list(centroids.values()))
+    global_mean = all_c.mean(axis=0)
+    global_mean /= np.linalg.norm(global_mean) + 1e-8
+
+    enriched = []
+    n_direct, n_mapped, n_fallback = 0, 0, 0
+
+    for p in pairs:
+        desc_key = p.get("desc_key", p["class_name"])
+
+        # Resolve desc_key → Code_18
+        if desc_key in centroids:
+            code = desc_key
+            n_direct += 1
+        elif _HRL_TO_CORINE.get(desc_key) in centroids:
+            code = _HRL_TO_CORINE[desc_key]
+            n_mapped += 1
+        elif desc_key.startswith("corine_") and desc_key[7:] in centroids:
+            code = desc_key[7:]
+            n_direct += 1
+        else:
+            code = None
+            n_fallback += 1
+            print(f"  [warn] No centroid for {desc_key!r} — using global mean")
+
+        if code:
+            sat_avg = torch.from_numpy(centroids[code]).float()
+            sat_augs = torch.from_numpy(augmented[code]).float()
+        else:
+            sat_avg = torch.from_numpy(global_mean).float()
+            sat_augs = sat_avg.unsqueeze(0).expand(16, -1).clone()
+
+        new_p = dict(p)
+        new_p["qwen_avg_embedding"] = p["avg_embedding"].clone()
+        new_p["qwen_sentence_embeddings"] = p["sentence_embeddings"].clone()
+        new_p["avg_embedding"] = sat_avg
+        new_p["sentence_embeddings"] = sat_augs
+        enriched.append(new_p)
+
+    print(f"  Satellite pairs: {n_direct} direct, {n_mapped} HRL-mapped, "
+          f"{n_fallback} fallback (global mean)")
+    return enriched
+
+
+def build_satellite_embedding_grid(cfg: "PipelineConfig",
+                                   cache_dir: Path) -> np.ndarray:
+    """Bin satellite embeddings into a (H, W, sat_emb_dim) spatial grid.
+
+    Each cell holds the mean embedding of all satellite observations that
+    fall in that pixel.  Empty cells are filled with the global mean.
+    Cached as sat_grid_{hash}.npy.
+    """
+    import hashlib
+    import pandas as pd
+
+    H = cfg.target_resolution
+    W = cfg.target_width
+
+    cache_key = hashlib.md5(
+        f"sat_grid|{H}x{W}|{cfg.sat_emb_path}|{cfg.sat_emb_dim}".encode()
+    ).hexdigest()[:12]
+    cache_path = cache_dir / f"sat_grid_{cache_key}.npy"
+
+    if cache_path.exists():
+        print(f"[cache] HIT → {cache_path}")
+        return np.load(cache_path)
+
+    old_parquet = Path(cfg.sat_emb_path)
+    if old_parquet.exists():
+        print(f"  Loading parquet for grid: {old_parquet}")
+        df = pd.read_parquet(old_parquet)
+    else:
+        df = _fetch_milvus_with_corine_join(cfg)
+
+    emb_cols = [f"v{i}" for i in range(cfg.sat_emb_dim)]
+    lats = df["lat"].values.astype(np.float64)
+    lons = df["lon"].values.astype(np.float64)
+    embs = df[emb_cols].values.astype(np.float32)
+
+    y_idx = ((cfg.lat_max - lats) / (cfg.lat_max - cfg.lat_min) * H).clip(0, H - 1).astype(np.int32)
+    x_idx = ((lons - cfg.lon_min) / (cfg.lon_max - cfg.lon_min) * W).clip(0, W - 1).astype(np.int32)
+    flat_idx = (y_idx * W + x_idx).astype(np.int64)
+
+    print(f"  Binning {len(df):,} embeddings into {H}×{W} grid ({cfg.sat_emb_dim} dims)...")
+    cnt = np.bincount(flat_idx, minlength=H * W).astype(np.float32)  # (H*W,)
+    grid_flat = np.stack([
+        np.bincount(flat_idx, weights=embs[:, d].astype(np.float64), minlength=H * W)
+        for d in range(cfg.sat_emb_dim)
+    ], axis=1).astype(np.float32)  # (H*W, sat_emb_dim)
+
+    filled = cnt > 0
+    grid_flat[filled] /= cnt[filled, np.newaxis]
+    grid_flat[~filled] = embs.mean(axis=0)  # fill empty cells with global mean
+
+    grid = grid_flat.reshape(H, W, cfg.sat_emb_dim)
+    np.save(cache_path, grid)
+    print(f"  Grid built: {int(filled.sum()):,}/{H*W:,} cells filled → {cache_path}")
+    return grid
+
+
+def build_density_weighted_sat_pairs(pairs: List[dict],
+                                     sat_grid: np.ndarray,
+                                     cfg: "PipelineConfig") -> List[dict]:
+    """Compute per-class density-weighted satellite centroids.
+
+    Each class centroid = density_map-weighted average of sat_grid embeddings
+    at that class's spatial footprint.  Gives distinct centroids for classes
+    that share a CORINE Code_18 (e.g. wheat vs sunflower, both Code_18=211)
+    because they occupy different geographic regions with different spectral
+    signatures.
+    """
+    H, W, D = sat_grid.shape
+    sat_flat = sat_grid.reshape(H * W, D)  # (H*W, 64)
+    rng = np.random.RandomState(42)
+    K = cfg.n_sat_augments
+
+    enriched = []
+    for p in pairs:
+        dm = p["density_map"].flatten().astype(np.float64)  # (H*W,)
+        w_sum = dm.sum()
+
+        if w_sum < 1e-8:
+            centroid = sat_flat.mean(axis=0)
+        else:
+            centroid = (dm[:, np.newaxis] / w_sum * sat_flat).sum(axis=0)  # (D,)
+
+        norm = np.linalg.norm(centroid) + 1e-8
+        centroid = (centroid / norm).astype(np.float32)
+
+        # Sub-centroid augmentations: resample 50% of positive-density pixels
+        pos = np.where(dm > 1e-4)[0]
+        augs = []
+        for _ in range(K):
+            if len(pos) < 4:
+                augs.append(centroid.copy())
+            else:
+                sub = rng.choice(pos, size=max(1, len(pos) // 2), replace=False)
+                w_sub = dm[sub]
+                w_sub = w_sub / (w_sub.sum() + 1e-8)
+                c = (w_sub[:, np.newaxis] * sat_flat[sub]).sum(axis=0)
+                c = (c / (np.linalg.norm(c) + 1e-8)).astype(np.float32)
+                augs.append(c)
+
+        new_p = dict(p)
+        # Preserve Qwen embeddings for bridge training
+        new_p["qwen_avg_embedding"] = p["avg_embedding"].clone()
+        new_p["qwen_sentence_embeddings"] = p["sentence_embeddings"].clone()
+        # Replace conditioning with density-weighted centroid
+        new_p["avg_embedding"] = torch.from_numpy(centroid).float()
+        new_p["sentence_embeddings"] = torch.from_numpy(np.stack(augs)).float()
+        enriched.append(new_p)
+
+    print(f"  Density-weighted sat pairs: {len(enriched)} classes")
+    return enriched
+
+
+# ============================================================
 # GPU-NATIVE DATA SAMPLER
 # ============================================================
 
@@ -372,7 +749,7 @@ class GPUSampler:
     """
 
     def __init__(self, pairs, cfg, device="cuda",
-                 n_text_tokens=8, text_dropout=0.0, raw_texts=None):
+                 n_text_tokens=8, text_dropout=0.0):
         self.device = device
         self.n_maps = len(pairs)
         self.n_text_tokens = n_text_tokens
@@ -396,28 +773,42 @@ class GPUSampler:
         probs = probs / probs.sum(dim=1, keepdim=True)
         self.sample_weights = probs.to(device)
 
-        # Precomputed text embeddings (for frozen mode / validation)
+        # Satellite embeddings for spatial model conditioning
         self.avg_embeddings = torch.stack(
             [p["avg_embedding"] for p in pairs]
         ).float().to(device)
 
         max_sents = max(len(p["sentence_embeddings"]) for p in pairs)
-        emb_dim = pairs[0]["sentence_embeddings"].shape[-1]
-        self.sent_embs = torch.zeros(self.n_maps, max_sents, emb_dim, device=device)
+        sat_dim = pairs[0]["sentence_embeddings"].shape[-1]
+        self.sent_embs = torch.zeros(self.n_maps, max_sents, sat_dim, device=device)
         self.n_sents = torch.zeros(self.n_maps, dtype=torch.long, device=device)
         for i, p in enumerate(pairs):
             n = len(p["sentence_embeddings"])
             self.sent_embs[i, :n] = p["sentence_embeddings"].to(device)
             self.n_sents[i] = n
 
-        # Raw text sentences per map (for on-the-fly Qwen encoding)
-        self.raw_sentences = None  # list of list of strings
-        if raw_texts is not None:
-            self.raw_sentences = []
-            for p in pairs:
-                desc_key = p.get("desc_key", p["class_name"])
-                sents = raw_texts.get(desc_key, [f"{p['class_name']} in Hungary"])
-                self.raw_sentences.append(sents)
+        # Qwen embeddings for bridge training (pre-computed, frozen)
+        has_qwen = "qwen_avg_embedding" in pairs[0]
+        if has_qwen:
+            self.qwen_avg_embs = torch.stack(
+                [p["qwen_avg_embedding"] for p in pairs]
+            ).float().to(device)
+            q_max = max(len(p["qwen_sentence_embeddings"]) for p in pairs)
+            q_dim = pairs[0]["qwen_sentence_embeddings"].shape[-1]
+            self.qwen_sent_embs = torch.zeros(
+                self.n_maps, q_max, q_dim, device=device
+            )
+            self.qwen_n_sents = torch.zeros(
+                self.n_maps, dtype=torch.long, device=device
+            )
+            for i, p in enumerate(pairs):
+                n = len(p["qwen_sentence_embeddings"])
+                self.qwen_sent_embs[i, :n] = p["qwen_sentence_embeddings"].to(device)
+                self.qwen_n_sents[i] = n
+        else:
+            self.qwen_avg_embs = None
+            self.qwen_sent_embs = None
+            self.qwen_n_sents = None
 
         # Per-class inverse-frequency weights for balanced loss
         pixel_masses = self.density_maps.sum(dim=(1, 2))  # (n_maps,)
@@ -425,8 +816,8 @@ class GPUSampler:
         self.class_weights = (inv_freq / inv_freq.mean()).to(device)  # normalized, mean=1
 
         print(f"  GPUSampler: {self.n_maps} maps, {H}x{W}, "
-              f"{max_sents} max sents, "
-              f"raw_texts={'yes' if self.raw_sentences else 'no'}")
+              f"{max_sents} sat-sents, "
+              f"qwen={'yes' if has_qwen else 'no'}")
         print(f"  Class weights (min={self.class_weights.min():.3f}, "
               f"max={self.class_weights.max():.3f}, mean={self.class_weights.mean():.3f})")
 
@@ -486,25 +877,25 @@ class GPUSampler:
         return text_embs
 
     def sample_batch(self):
-        """Batch with precomputed embeddings (no Qwen forward)."""
+        """Batch with precomputed satellite embeddings."""
         B = self.batch_size
         coords, targets, map_indices = self._sample_coords_and_targets(B)
         text_embs = self._sample_precomputed_embs(map_indices)
         return coords, text_embs, targets, map_indices
 
-    def sample_texts_for_maps(self, map_indices):
-        """Pick one random raw text sentence per map index. Returns list of strings."""
-        if self.raw_sentences is None:
-            raise RuntimeError("GPUSampler has no raw_sentences (pass raw_texts to constructor)")
-        import random
-        map_list = map_indices.cpu().tolist()
-        # For efficiency, pick one unique text per unique map in the batch
-        unique_maps = list(set(map_list))
-        map_to_text = {}
-        for m in unique_maps:
-            sents = self.raw_sentences[m]
-            map_to_text[m] = random.choice(sents)
-        return [map_to_text[m] for m in unique_maps], unique_maps
+    def _sample_qwen_embs(self, map_indices):
+        """Sample Qwen text embeddings for bridge alignment training."""
+        if self.qwen_sent_embs is None:
+            raise RuntimeError("GPUSampler has no Qwen embeddings (pairs not satellite-enriched)")
+        B = len(map_indices)
+        n_tok = self.n_text_tokens
+        map_n = self.qwen_n_sents[map_indices]
+        rand_idx = torch.rand(B, n_tok, device=self.device)
+        sent_idx = (rand_idx * map_n.unsqueeze(1).float()).long()
+        sent_idx = sent_idx.clamp(max=self.qwen_sent_embs.shape[1] - 1)
+        expanded = map_indices.unsqueeze(1).expand(-1, n_tok)
+        selected = self.qwen_sent_embs[expanded, sent_idx]
+        return selected.mean(dim=1)
 
 
 # ============================================================
@@ -549,6 +940,16 @@ def compute_discrimination_loss(model, coords, text_embs, map_indices, n_coords=
         idx_b = class_indices[map_b]
         n = min(n_coords, len(idx_a), len(idx_b))
         if n < 2:
+            continue
+
+        # Skip pairs that share a satellite centroid (identical conditioning).
+        # For these pairs pred_a == pred_b by construction, so disc loss = 1.0
+        # always with zero useful gradient — it just fights the MSE loss.
+        cos_sim = F.cosine_similarity(
+            text_embs[idx_a[0]].unsqueeze(0),
+            text_embs[idx_b[0]].unsqueeze(0),
+        ).item()
+        if cos_sim > 0.95:
             continue
 
         # Random subset of coordinates
@@ -698,50 +1099,63 @@ def pretrain_qwen_classifier(text_encoder, raw_texts, pairs, cfg, device="cuda")
 
 
 def train(model, train_sampler, cfg, device="cuda", sample_pairs=None,
-          val_sampler=None, text_encoder=None):
+          val_sampler=None, bridge=None):
     """Training loop with GPU-native sampling, AMP, discrimination loss,
-    and optional Qwen fine-tuning."""
+    and optional TextToSatBridge for zero-shot text inference.
+
+    Stages:
+      Epochs 0 .. bridge_start_epoch-1:
+        Spatial model trains on satellite embeddings only.
+      Epochs bridge_start_epoch .. end:
+        text_mix_ratio fraction of batches use bridge(Qwen_emb) as conditioning.
+        Alignment loss penalizes bridge output diverging from satellite centroids.
+    """
+    import random
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     model.to(device)
+    if bridge is not None:
+        bridge.to(device)
 
     # Resume from checkpoint
     ckpt_path = Path(cfg.output_dir) / "checkpoint_v2.pt"
     start_epoch = 0
     epoch_losses, val_losses = [], []
-    disc_losses = []
+    disc_losses, align_losses = [], []
     saved_opt, saved_sched = None, None
 
     if ckpt_path.exists():
         print(f"[resume] Loading {ckpt_path}")
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model"])
-        saved_opt = ckpt["optimizer"]
-        saved_sched = ckpt["scheduler"]
-        start_epoch = ckpt["epoch"] + 1
-        epoch_losses = ckpt.get("losses", [])
-        val_losses = ckpt.get("val_losses", [])
-        disc_losses = ckpt.get("disc_losses", [])
-        if text_encoder is not None and "qwen_lora" in ckpt:
-            # Load LoRA weights from checkpoint
-            te_module = text_encoder
-            te_module._model.load_state_dict(ckpt["qwen_lora"], strict=False)
-            print(f"  Loaded Qwen LoRA weights from checkpoint")
-        print(f"  Resuming from epoch {start_epoch}")
+        try:
+            model.load_state_dict(ckpt["model"])
+            if bridge is not None and "bridge" in ckpt:
+                bridge.load_state_dict(ckpt["bridge"])
+                print(f"  Loaded bridge weights from checkpoint")
+            saved_opt = ckpt["optimizer"]
+            saved_sched = ckpt["scheduler"]
+            start_epoch = ckpt["epoch"] + 1
+            epoch_losses = ckpt.get("losses", [])
+            val_losses = ckpt.get("val_losses", [])
+            disc_losses = ckpt.get("disc_losses", [])
+            align_losses = ckpt.get("align_losses", [])
+            print(f"  Resuming from epoch {start_epoch}")
+        except (RuntimeError, KeyError) as e:
+            print(f"  [warn] Checkpoint incompatible (architecture changed) — starting fresh")
+            print(f"         {e}")
+            start_epoch = 0
 
-    # Optimizer: separate param groups for spatial model and Qwen LoRA
+    # Optimizer: spatial model + optional bridge
     param_groups = [
         {"params": model.parameters(), "lr": cfg.lr, "weight_decay": cfg.weight_decay},
     ]
-    if text_encoder is not None:
-        te_module = text_encoder
-        qwen_params = [p for p in te_module.parameters() if p.requires_grad]
-        n_qwen = sum(p.numel() for p in qwen_params)
-        print(f"  Qwen LoRA trainable params: {n_qwen:,}")
+    if bridge is not None:
+        n_bridge = sum(p.numel() for p in bridge.parameters())
+        print(f"  Bridge trainable params: {n_bridge:,}")
         param_groups.append(
-            {"params": qwen_params, "lr": cfg.qwen_lr, "weight_decay": 0.0}
+            {"params": bridge.parameters(), "lr": cfg.bridge_lr, "weight_decay": 0.0}
         )
 
     optimizer = torch.optim.AdamW(param_groups, foreach=False)
@@ -773,74 +1187,55 @@ def train(model, train_sampler, cfg, device="cuda", sample_pairs=None,
         viz_dir.mkdir(parents=True, exist_ok=True)
 
     n_params = sum(p.numel() for p in model.parameters())
+    bridge_active = bridge is not None and train_sampler.qwen_sent_embs is not None
     print(f"\nTraining: {n_params:,} spatial params, {train_sampler.samples_per_epoch:,} samples/epoch")
     print(f"  {n_batches_per_epoch} batches/epoch × {cfg.batch_size:,} = {n_batches_per_epoch * cfg.batch_size:,} samples")
     print(f"  Discrimination weight: {cfg.discrimination_weight}")
-    print(f"  Text dropout: {cfg.text_dropout}")
-    print(f"  Batch size: {cfg.batch_size:,}")
-    print(f"  Qwen fine-tune: {'ON' if text_encoder else 'OFF'}")
+    print(f"  Sat embedding dropout: {cfg.text_dropout}")
+    print(f"  Bridge: {'ON (starts epoch ' + str(cfg.bridge_start_epoch) + ')' if bridge_active else 'OFF'}")
     print(f"  AMP: bfloat16")
 
     model.train()
-    if text_encoder is not None:
-        te_module = text_encoder
-        te_module.train()
+    if bridge is not None:
+        bridge.train()
 
     for epoch in range(start_epoch, cfg.n_epochs):
-        ep_mse, ep_disc = 0.0, 0.0
+        ep_mse, ep_disc, ep_align = 0.0, 0.0, 0.0
+        use_bridge_this_epoch = (
+            bridge_active and epoch >= cfg.bridge_start_epoch
+        )
 
         pbar = tqdm(range(n_batches_per_epoch), desc=f"Epoch {epoch+1:3d}",
                     leave=False, ncols=120)
         for batch_i in pbar:
-            # --- GPU-native batch generation ---
             coords, targets, map_indices = train_sampler._sample_coords_and_targets(cfg.batch_size)
 
-            # --- Text embeddings: on-the-fly Qwen or precomputed ---
-            if text_encoder is not None and train_sampler.raw_sentences is not None:
-                # Get unique texts for this batch
-                texts, unique_map_list = train_sampler.sample_texts_for_maps(map_indices)
+            # --- Choose conditioning: satellite centroid or bridge(Qwen) ---
+            use_bridge_batch = (
+                use_bridge_this_epoch and random.random() < cfg.text_mix_ratio
+            )
 
-                # Tokenize on CPU, encode on Qwen's device (GPU 1)
-                tokenizer = text_encoder.tokenizer
-                qwen_dev = next(text_encoder.parameters()).device
-                chunk_size = cfg.qwen_batch_size
-                emb_parts = []
-                for ci in range(0, len(texts), chunk_size):
-                    chunk_texts = texts[ci:ci + chunk_size]
-                    inputs = tokenizer(
-                        chunk_texts, return_tensors="pt",
-                        truncation=True, max_length=512, padding=True,
-                    )
-                    input_ids = inputs["input_ids"].to(qwen_dev)
-                    attn_mask = inputs["attention_mask"].to(qwen_dev)
-                    with torch.autocast(qwen_dev.type, dtype=torch.bfloat16):
-                        emb_parts.append(text_encoder(input_ids, attn_mask))
-                unique_embs = torch.cat(emb_parts, dim=0).to(device)  # transfer to GPU 0
-
-                # Map unique embeddings back to full batch
-                map_to_idx = {m: i for i, m in enumerate(unique_map_list)}
-                batch_emb_idx = torch.tensor(
-                    [map_to_idx[m.item()] for m in map_indices], device=device
-                )
-                text_embs = unique_embs[batch_emb_idx]
+            if use_bridge_batch:
+                qwen_embs = train_sampler._sample_qwen_embs(map_indices)
+                cond_embs = bridge(qwen_embs)   # (B, sat_dim) — L2-normalized
             else:
-                text_embs = train_sampler._sample_precomputed_embs(map_indices)
+                cond_embs = train_sampler._sample_precomputed_embs(map_indices)
 
-            # Text dropout
-            if cfg.text_dropout > 0:
-                mask = torch.rand(len(text_embs), device=device) < cfg.text_dropout
-                text_embs = text_embs.clone()
-                text_embs[mask] = 0.0
+            # Satellite embedding dropout (only on sat path, not bridge path)
+            if not use_bridge_batch and cfg.text_dropout > 0:
+                mask = torch.rand(len(cond_embs), device=device) < cfg.text_dropout
+                cond_embs = cond_embs.clone()
+                cond_embs[mask] = 0.0
 
             # --- Forward with AMP ---
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                preds = model(coords, text_embs)
+                preds = model(coords, cond_embs)
                 class_w = train_sampler.class_weights[map_indices]
                 signal_w = 1.0 + 4.0 * targets
                 mse_loss = (class_w * signal_w * (preds - targets) ** 2).mean()
 
                 disc_loss = compute_discrimination_loss(
-                    model, coords, text_embs, map_indices, n_coords=32
+                    model, coords, cond_embs, map_indices, n_coords=32
                 )
 
                 if epoch < cfg.disc_warmup_epochs:
@@ -852,33 +1247,48 @@ def train(model, train_sampler, cfg, device="cuda", sample_pairs=None,
                 else:
                     disc_w = cfg.discrimination_weight
 
-                loss = mse_loss + disc_w * disc_loss
+                # Bridge alignment loss: cosine distance between bridge output
+                # and per-class satellite centroids (computed on unique classes)
+                align_loss = torch.tensor(0.0, device=device)
+                if use_bridge_this_epoch and bridge is not None:
+                    unique_maps = torch.unique(map_indices)
+                    q_avg = train_sampler.qwen_avg_embs[unique_maps]
+                    s_avg = train_sampler.avg_embeddings[unique_maps]
+                    bridge_out = bridge(q_avg)
+                    align_loss = (
+                        1 - F.cosine_similarity(bridge_out, s_avg, dim=-1)
+                    ).mean()
+
+                loss = (mse_loss + disc_w * disc_loss
+                        + cfg.bridge_weight * align_loss)
 
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            if text_encoder is not None:
-                te_module = text_encoder
-                torch.nn.utils.clip_grad_norm_(te_module.parameters(), 1.0)
+            if bridge is not None:
+                torch.nn.utils.clip_grad_norm_(bridge.parameters(), 1.0)
             optimizer.step()
             scheduler.step()
 
             ep_mse += mse_loss.item()
             ep_disc += disc_loss.item()
+            ep_align += align_loss.item()
 
-            # Update progress bar
             pbar.set_postfix({
                 "mse": f"{ep_mse/(batch_i+1):.4f}",
                 "disc": f"{ep_disc/(batch_i+1):.4f}",
+                "align": f"{ep_align/(batch_i+1):.4f}",
                 "lr": f"{optimizer.param_groups[0]['lr']:.1e}",
             })
 
         avg_mse = ep_mse / n_batches_per_epoch
         avg_disc = ep_disc / n_batches_per_epoch
+        avg_align = ep_align / n_batches_per_epoch
         epoch_losses.append(avg_mse)
         disc_losses.append(avg_disc)
+        align_losses.append(avg_align)
 
-        # --- Validation (always uses precomputed embeddings) ---
+        # --- Validation (always uses satellite embeddings) ---
         avg_val = float("nan")
         if val_sampler is not None:
             model.eval()
@@ -894,15 +1304,15 @@ def train(model, train_sampler, cfg, device="cuda", sample_pairs=None,
             avg_val = val_sum / max(1, n_val_batches)
             val_losses.append(avg_val)
             model.train()
-            if text_encoder is not None:
-                te_module = text_encoder
-                te_module.train()
+            if bridge is not None:
+                bridge.train()
 
         lr_now = optimizer.param_groups[0]['lr']
-        qwen_lr_str = f", qwen_lr={optimizer.param_groups[1]['lr'] * lr_lambda(scheduler.last_epoch):.2e}" if text_encoder else ""
         if (epoch + 1) % 10 == 0 or epoch == 0:
             val_str = f", val={avg_val:.5f}" if not math.isnan(avg_val) else ""
-            print(f"Epoch {epoch+1:4d}: mse={avg_mse:.5f}, disc={avg_disc:.5f}{val_str}, lr={lr_now:.2e}{qwen_lr_str}")
+            align_str = f", align={avg_align:.4f}" if use_bridge_this_epoch else ""
+            print(f"Epoch {epoch+1:4d}: mse={avg_mse:.5f}, disc={avg_disc:.5f}"
+                  f"{align_str}{val_str}, lr={lr_now:.2e}")
 
         # --- Visualization + checkpoint ---
         if cfg.plot_every > 0 and ((epoch + 1) % cfg.plot_every == 0 or epoch == 0):
@@ -919,8 +1329,11 @@ def train(model, train_sampler, cfg, device="cuda", sample_pairs=None,
             if disc_losses:
                 ax2 = axes[0].twinx()
                 ax2.plot(disc_losses, linewidth=1.2, color="coral", alpha=0.7, label="disc")
-                ax2.set_ylabel("Disc", fontsize=8, color="coral")
-                ax2.tick_params(axis='y', labelcolor='coral', labelsize=7)
+                if any(a > 0 for a in align_losses):
+                    ax2.plot(align_losses, linewidth=1.2, color="steelblue",
+                             alpha=0.7, label="align")
+                ax2.set_ylabel("Disc / Align", fontsize=8)
+                ax2.tick_params(axis='y', labelsize=7)
             axes[0].legend(fontsize=8)
             axes[0].set_title("Loss")
             axes[0].set_xlabel("Epoch")
@@ -955,20 +1368,16 @@ def train(model, train_sampler, cfg, device="cuda", sample_pairs=None,
                 "losses": epoch_losses,
                 "val_losses": val_losses,
                 "disc_losses": disc_losses,
+                "align_losses": align_losses,
                 "config": vars(cfg),
             }
-            if text_encoder is not None:
-                te_module = text_encoder
-                ckpt_data["qwen_lora"] = {
-                    k: v for k, v in te_module._model.state_dict().items()
-                    if "lora" in k.lower()
-                }
+            if bridge is not None:
+                ckpt_data["bridge"] = bridge.state_dict()
             torch.save(ckpt_data, ckpt_path)
             print(f"  [ckpt] Saved → {ckpt_path}")
             model.train()
-            if text_encoder is not None:
-                te_module = text_encoder
-                te_module.train()
+            if bridge is not None:
+                bridge.train()
 
     return model
 
@@ -1018,9 +1427,11 @@ def main():
     print("STEP 2: Load text-paired training data")
     print("=" * 60)
 
+    # Pairs cache always uses full Qwen dim (2560) — satellite enrichment
+    # happens in Step 3 on top of these cached Qwen embeddings.
     pairs_hash = _cfg_hash(
         dist_hash, cfg.text_descriptions_path, cfg.hrl_descriptions_path,
-        cfg.text_emb_dim,
+        cfg.qwen_emb_dim,
     )
     pairs_cache = cache_dir / f"pairs_{pairs_hash}.pt"
 
@@ -1031,7 +1442,7 @@ def main():
     else:
         from full_flow import build_training_pairs
         from fine_tune.qwen3_adapter import Qwen3EmbeddingAdapter
-        enc = Qwen3EmbeddingAdapter(target_dim=cfg.text_emb_dim, freeze_encoder=True)
+        enc = Qwen3EmbeddingAdapter(target_dim=cfg.qwen_emb_dim, freeze_encoder=True)
         enc = enc.to(device).eval()
         pairs = build_training_pairs(
             distributions, cfg.text_descriptions_path, enc,
@@ -1041,38 +1452,17 @@ def main():
         torch.cuda.empty_cache()
         torch.save(pairs, pairs_cache)
 
-    # --- Step 3: Load raw texts for on-the-fly encoding ---
-    raw_texts = None
-    text_encoder = None
-    if cfg.fine_tune_qwen:
-        print("\n" + "=" * 60)
-        print("STEP 3a: Load raw texts + Qwen with LoRA")
-        print("=" * 60)
-        raw_texts = load_raw_texts(
-            cfg.text_descriptions_path,
-            extra_paths=[cfg.hrl_descriptions_path],
-            filter_relevance=cfg.filter_text_relevance,
-        )
-        print(f"  Loaded {len(raw_texts)} text descriptions")
-
-        from fine_tune.qwen3_adapter import Qwen3EmbeddingAdapter
-        qwen_device = "cuda:1" if torch.cuda.device_count() > 1 else device
-        text_encoder = Qwen3EmbeddingAdapter(
-            target_dim=cfg.text_emb_dim,
-            freeze_encoder=False,
-            lora=True,
-        ).to(qwen_device)
-        print(f"  Qwen on {qwen_device} (spatial model on {device})")
-
-        # --- Stage 1: Classification preconditioning ---
-        print("\n" + "=" * 60)
-        print("STAGE 1: Qwen classification preconditioning")
-        print("=" * 60)
-        pretrain_qwen_classifier(text_encoder, raw_texts, pairs, cfg, device=device)
-
-    # --- Step 3b: Split and build GPU samplers ---
+    # --- Step 3: Build satellite centroids and enrich pairs ---
     print("\n" + "=" * 60)
-    print("STEP 3b: Build GPU-native samplers (class-level split)")
+    print("STEP 3: Build AlphaEarth satellite conditioning")
+    print("=" * 60)
+
+    sat_grid = build_satellite_embedding_grid(cfg, cache_dir)
+    pairs = build_density_weighted_sat_pairs(pairs, sat_grid, cfg)
+
+    # --- Step 4: Build GPU samplers ---
+    print("\n" + "=" * 60)
+    print("STEP 4: Build GPU-native samplers (class-level split)")
     print("=" * 60)
 
     train_pairs, val_pairs = split_pairs_by_class(
@@ -1082,7 +1472,6 @@ def main():
     train_sampler = GPUSampler(
         train_pairs, cfg, device=device,
         text_dropout=cfg.text_dropout,
-        raw_texts=raw_texts,
     )
     val_sampler = GPUSampler(
         val_pairs, cfg, device=device,
@@ -1092,9 +1481,9 @@ def main():
     print(f"  Train: {train_sampler.samples_per_epoch:,} samples, {len(train_pairs)} classes")
     print(f"  Val:   {val_sampler.samples_per_epoch:,} samples, {len(val_pairs)} classes")
 
-    # --- Step 4: Build and train model ---
+    # --- Step 5: Build spatial model + TextToSatBridge ---
     print("\n" + "=" * 60)
-    print("STAGE 2: Train SpatialBasisFieldV2")
+    print("STAGE 2: Train SpatialBasisFieldV2 + TextToSatBridge")
     print("=" * 60)
 
     model = SpatialBasisFieldV2(
@@ -1106,13 +1495,28 @@ def main():
         coord_hidden=cfg.coord_hidden,
     )
 
+    # Bridge requires Qwen embeddings to be stored in the pairs
+    has_qwen = train_sampler.qwen_sent_embs is not None
+    bridge = None
+    if has_qwen:
+        bridge = TextToSatBridge(
+            text_dim=cfg.qwen_emb_dim,
+            sat_dim=cfg.sat_emb_dim,
+            hidden_dim=cfg.bridge_hidden_dim,
+        )
+        print(f"  TextToSatBridge: {cfg.qwen_emb_dim}→{cfg.bridge_hidden_dim}→{cfg.sat_emb_dim}")
+        print(f"  Bridge starts at epoch {cfg.bridge_start_epoch}, "
+              f"mix ratio {cfg.text_mix_ratio:.0%}")
+    else:
+        print("  [warn] No Qwen embeddings found in pairs — bridge disabled")
+
     model = train(model, train_sampler, cfg, device,
                   sample_pairs=pairs, val_sampler=val_sampler,
-                  text_encoder=text_encoder)
+                  bridge=bridge)
 
-    # --- Step 5: Save ---
+    # --- Step 6: Save ---
     print("\n" + "=" * 60)
-    print("STEP 5: Save final model")
+    print("STEP 6: Save final model")
     print("=" * 60)
 
     out = Path(cfg.output_dir)
@@ -1122,12 +1526,8 @@ def main():
         "config": vars(cfg),
         "class_names": [p["class_name"] for p in pairs],
     }
-    if text_encoder is not None:
-        te_module = text_encoder
-        save_data["qwen_lora"] = {
-            k: v for k, v in te_module._model.state_dict().items()
-            if "lora" in k.lower()
-        }
+    if bridge is not None:
+        save_data["bridge"] = bridge.state_dict()
     torch.save(save_data, out / "spatial_basis_field_v2.pt")
     print(f"✅ Saved to {out / 'spatial_basis_field_v2.pt'}")
 

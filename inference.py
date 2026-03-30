@@ -183,17 +183,30 @@ def load_model(checkpoint_path: str, device: str = "cuda"):
     model = model.to(device).eval()
     class_names = ckpt.get("class_names", [])
     qwen_lora = ckpt.get("qwen_lora", None)
+    bridge_state = ckpt.get("bridge", None)
 
-    return model, cfg, class_names, qwen_lora
+    bridge = None
+    if bridge_state is not None:
+        from flow_2 import TextToSatBridge
+        bridge_cfg = cfg if isinstance(cfg, dict) else vars(cfg)
+        b = TextToSatBridge(
+            text_dim=bridge_cfg.get("qwen_emb_dim", 2560),
+            sat_dim=bridge_cfg.get("sat_emb_dim", 64),
+            hidden_dim=bridge_cfg.get("bridge_hidden_dim", 256),
+        )
+        b.load_state_dict(bridge_state)
+        bridge = b.to(device).eval()
+        print(f"  Loaded TextToSatBridge weights")
+
+    return model, cfg, class_names, qwen_lora, bridge
 
 
-def load_text_encoder(device: str = "cuda", qwen_lora: dict = None):
-    """Load Qwen3EmbeddingAdapter with optional LoRA weights."""
+def load_text_encoder(device: str = "cuda", qwen_lora=None):
+    """Load Qwen3EmbeddingAdapter (frozen) for bridge-based inference."""
     from fine_tune.qwen3_adapter import Qwen3EmbeddingAdapter
 
-    # If we have LoRA weights, load with LoRA architecture so the keys match
     has_lora = qwen_lora is not None and len(qwen_lora) > 0
-    print(f"Loading Qwen text encoder (LoRA={'yes' if has_lora else 'no'})...")
+    print(f"Loading Qwen text encoder (frozen, LoRA={'yes' if has_lora else 'no'})...")
 
     encoder = Qwen3EmbeddingAdapter(
         target_dim=2560,
@@ -202,7 +215,6 @@ def load_text_encoder(device: str = "cuda", qwen_lora: dict = None):
     )
 
     if has_lora:
-        # Inject the fine-tuned LoRA weights
         encoder._model.load_state_dict(qwen_lora, strict=False)
         print(f"  Loaded {len(qwen_lora)} LoRA weight tensors")
 
@@ -336,38 +348,48 @@ def main():
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- Load model ---
-    model, cfg, class_names, qwen_lora = load_model(args.checkpoint, device)
+    # --- Load model + bridge ---
+    model, cfg, class_names, qwen_lora, bridge = load_model(args.checkpoint, device)
     if args.height:
         cfg["target_resolution"] = args.height
     if args.no_lora:
         qwen_lora = None
 
-    # --- Load text encoder ---
-    # Put Qwen on a second GPU if available, otherwise share the device
-    if torch.cuda.device_count() > 1:
-        enc_device = "cuda:1"
-    else:
-        enc_device = device
-    encoder = load_text_encoder(enc_device, qwen_lora)
+    # Determine whether this is a satellite-conditioned checkpoint
+    is_sat_model = cfg.get("text_emb_dim", 2560) <= 64
+
+    # --- Load Qwen encoder once if any query mode needs it ---
+    enc_device = "cuda:1" if torch.cuda.device_count() > 1 else device
+    encoder = None
+    needs_qwen = args.query or (args.all_classes and bridge is not None)
+    if needs_qwen:
+        print("Loading Qwen encoder for text encoding...")
+        encoder = load_text_encoder(enc_device, qwen_lora)
 
     # --- Render queries ---
     if args.query:
         densities, titles = [], []
         for text in args.query:
             print(f"\nRendering: \"{text}\"")
-            emb = encoder.encode_raw(text, normalize=False)  # (1, 2560)
+
+            if bridge is not None and encoder is not None:
+                # Zero-shot path: Qwen → bridge → satellite space
+                qwen_emb = encoder.encode_raw(text, normalize=False)  # (1, 2560)
+                with torch.no_grad():
+                    emb = bridge(qwen_emb.to(device))  # (1, 64)
+            elif encoder is not None:
+                emb = encoder.encode_raw(text, normalize=False)
+            else:
+                raise RuntimeError("No encoder available for query mode")
+
             density = render_density_map(model, emb, cfg, device)
 
-            # Save individual plot
             safe_name = text.lower().replace(" ", "_")[:50]
             plot_density_map(density, cfg, title=text,
                              save_path=out_dir / f"{safe_name}.png")
-
             densities.append(density)
             titles.append(text)
 
-        # Save grid if multiple queries
         if len(densities) > 1:
             plot_multi_grid(densities, titles, cfg,
                             save_path=out_dir / "query_grid.png")
@@ -376,13 +398,14 @@ def main():
     if args.all_classes:
         print(f"\nRendering all {len(class_names)} training classes...")
 
-        # Try to load precomputed embeddings from cache for speed
+        # Load precomputed satellite embeddings from cache
         pairs_cache = list(Path("pipeline_cache").glob("pairs_*.pt"))
         precomputed = {}
         if pairs_cache:
-            print(f"  Loading precomputed embeddings from {pairs_cache[0]}")
-            pairs = torch.load(pairs_cache[0], map_location="cpu", weights_only=False)
-            for p in pairs:
+            print(f"  Loading pairs cache: {pairs_cache[0]}")
+            cached_pairs = torch.load(pairs_cache[0], map_location="cpu",
+                                      weights_only=False)
+            for p in cached_pairs:
                 precomputed[p["class_name"]] = p["avg_embedding"]
 
         densities, titles = [], []
@@ -390,10 +413,18 @@ def main():
             print(f"  {name}...", end=" ", flush=True)
 
             if name in precomputed:
-                emb = precomputed[name].unsqueeze(0)
+                emb = precomputed[name].unsqueeze(0).to(device)
+            elif encoder is not None:
+                # Fallback: encode class name via Qwen → bridge (or direct)
+                qwen_emb = encoder.encode_raw(name, normalize=False)
+                if bridge is not None:
+                    with torch.no_grad():
+                        emb = bridge(qwen_emb.to(device))
+                else:
+                    emb = qwen_emb
             else:
-                # Fall back to on-the-fly encoding
-                emb = encoder.encode_raw(name, normalize=False)
+                print(f"  [skip] No embedding for {name}")
+                continue
 
             density = render_density_map(model, emb, cfg, device)
 
@@ -404,7 +435,6 @@ def main():
             titles.append(name)
             print("✓")
 
-        # Grid of all classes
         plot_multi_grid(densities, titles, cfg,
                         save_path=out_dir / "all_classes_grid.png",
                         ncols=5)
