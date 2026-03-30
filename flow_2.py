@@ -80,7 +80,7 @@ class PipelineConfig:
     samples_per_epoch: int = 2_000_000
     val_samples: int = 100_000
     weight_decay: float = 1e-5
-    text_dropout: float = 0.1        # fraction of samples with zeroed sat embedding
+    text_dropout: float = 0.0        # no dropout — always condition on sat embedding
     discrimination_weight: float = 0.5
     disc_warmup_epochs: int = 50
     disc_ramp_epochs: int = 50
@@ -1392,10 +1392,22 @@ def _cfg_hash(*parts) -> str:
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--device", default=None, help="e.g. cuda:0, cuda:1, cpu")
+    parser.add_argument("--output-dir", default=None, help="override cfg.output_dir")
+    args = parser.parse_args()
+
     cfg = PipelineConfig()
+    if args.output_dir:
+        cfg.output_dir = args.output_dir
     cache_dir = Path(cfg.cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    if args.device:
+        device = args.device
+    else:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # --- Step 1: Load cached distributions ---
     # (reuse your existing v1 cache — density maps haven't changed)
