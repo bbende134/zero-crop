@@ -13,7 +13,11 @@ data_corine/*
 .env
 keys.json
 
-training_data/
+# training_data/
 inference_outputs/
 *.pt
 key.json
+
+training*/**/*.png
+*.npy
+*.log

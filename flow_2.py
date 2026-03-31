@@ -82,12 +82,10 @@ class PipelineConfig:
     val_samples: int = 100_000
     weight_decay: float = 1e-5
     text_dropout: float = 0.0        # no dropout — always condition on sat embedding
-    discrimination_weight: float = 0.0
-    disc_warmup_epochs: int = 50
-    disc_ramp_epochs: int = 50
+    film_contrastive_weight: float = 0.1
+    film_contrastive_warmup: int = 0
     plot_every: int = 20
     val_class_fraction: float = 0.2
-    disc_max_pairs: int = 40
 
     @property
     def target_width(self):
@@ -232,12 +230,13 @@ class SpatialBasisFieldV2(nn.Module):
         """Project text to conditioning vector."""
         return self.text_proj(self.text_norm(text_emb))
 
-    def forward(self, coords, text_emb):
+    def forward(self, coords, text_emb, return_film_acts=False):
         """
         coords:   (B, 2) normalized lat/lon in [-1, 1]
         text_emb: (B, text_dim) text embedding
 
         Returns:  (B,) predicted density in [0, 1]
+                  If return_film_acts: (density, [h1, h2, h3]) with FiLM activations
         """
         # Text conditioning
         text_cond = self._get_text_cond(text_emb)  # (B, text_proj_dim)
@@ -247,9 +246,16 @@ class SpatialBasisFieldV2(nn.Module):
 
         # Coordinate features — FiLM conditioned by text
         coord_feat = self.fourier(coords)                            # (B, fourier_dim)
+        film_acts = []
         h = self.trunk_layer1(coord_feat, text_cond)                 # (B, coord_hidden)
+        if return_film_acts:
+            film_acts.append(h)
         h = self.trunk_layer2(h, text_cond)                          # (B, coord_hidden)
+        if return_film_acts:
+            film_acts.append(h)
         h = self.trunk_layer3(h, text_cond)                          # (B, coord_hidden)
+        if return_film_acts:
+            film_acts.append(h)
 
         # Evaluate all basis heads in one vectorized op
         h_bases = self.basis_layer1(h)                                         # (B, K*D)
@@ -259,6 +265,8 @@ class SpatialBasisFieldV2(nn.Module):
 
         # Weighted combination
         density = (basis_out * factors).sum(dim=-1)  # (B,)
+        if return_film_acts:
+            return density.clamp(0, 1), film_acts
         return density.clamp(0, 1)
 
     @torch.no_grad()
@@ -305,6 +313,39 @@ class SpatialBasisFieldV2(nn.Module):
         basis_all = torch.sigmoid(basis_logits)  # (H*W, K)
         maps = [basis_all[:, k].view(H, W).cpu().numpy() for k in range(self.n_bases)]
         return maps
+
+
+def film_contrastive_loss(film_acts, map_indices):
+    """Push FiLM activations apart for different conditioning vectors.
+
+    Computes per-class centroid of each FiLM layer's output, then penalizes
+    high cosine similarity between centroids of different classes.
+    """
+    unique_classes, inverse = torch.unique(map_indices, return_inverse=True)
+    n_classes = len(unique_classes)
+    if n_classes < 2:
+        return torch.tensor(0.0, device=map_indices.device)
+
+    total_loss = torch.tensor(0.0, device=map_indices.device)
+    mask = ~torch.eye(n_classes, dtype=torch.bool, device=map_indices.device)
+
+    for act in film_acts:
+        # Per-class centroids via scatter
+        centroids = torch.zeros(n_classes, act.shape[1], device=act.device, dtype=act.dtype)
+        counts = torch.zeros(n_classes, 1, device=act.device, dtype=act.dtype)
+        idx = inverse.unsqueeze(1).expand_as(act)
+        centroids.scatter_add_(0, idx, act)
+        counts.scatter_add_(0, inverse.unsqueeze(1), torch.ones_like(act[:, :1]))
+        centroids = centroids / counts.clamp(min=1)
+
+        # L2-normalize in float32 for stability
+        centroids = F.normalize(centroids.float(), dim=-1)
+
+        # Squared cosine similarity of off-diagonal pairs
+        sim = centroids @ centroids.T
+        total_loss = total_loss + (sim[mask] ** 2).mean()
+
+    return total_loss / len(film_acts)
 
 
 _KEEP_PATTERNS = [
@@ -658,7 +699,6 @@ def build_satellite_embedding_grid(cfg: "PipelineConfig",
     Cached as sat_grid_{hash}.npy.
     """
     import hashlib
-    import pandas as pd
 
     H = cfg.target_resolution
     W = cfg.target_width
@@ -672,6 +712,7 @@ def build_satellite_embedding_grid(cfg: "PipelineConfig",
         print(f"[cache] HIT → {cache_path}")
         return np.load(cache_path)
 
+    import pandas as pd
     old_parquet = Path(cfg.sat_emb_path)
     if old_parquet.exists():
         print(f"  Loading parquet for grid: {old_parquet}")
@@ -939,74 +980,6 @@ class GPUSampler:
 # TRAINING
 # ============================================================
 
-def compute_discrimination_loss(model, coords, text_embs, map_indices, n_coords=32):
-    """At shared coordinates, different text should produce different outputs.
-
-    Iterates over ALL unique class pairs in the batch (not just one random pair),
-    uses shared coordinates, and penalizes predictions being too similar.
-    Loss: 1 / (1 + |pred_a - pred_b|)  → 1 when identical, → 0 when different.
-    """
-    unique_maps = torch.unique(map_indices)
-    n_classes = len(unique_maps)
-    if n_classes < 2:
-        return torch.tensor(0.0, device=coords.device)
-
-    # Precompute indices per class
-    class_indices = {}
-    for m in unique_maps:
-        class_indices[m.item()] = (map_indices == m).nonzero(as_tuple=True)[0]
-
-    total_loss = torch.tensor(0.0, device=coords.device)
-    n_pairs_done = 0
-
-    # Cap the number of class pairs to avoid blowup with many classes
-    class_list = unique_maps.tolist()
-    max_pairs = 40
-    if n_classes * (n_classes - 1) // 2 > max_pairs:
-        # Random subset of pairs
-        import itertools
-        all_pairs = list(itertools.combinations(class_list, 2))
-        perm = torch.randperm(len(all_pairs))[:max_pairs].tolist()
-        pair_list = [all_pairs[i] for i in perm]
-    else:
-        import itertools
-        pair_list = list(itertools.combinations(class_list, 2))
-
-    for map_a, map_b in pair_list:
-        idx_a = class_indices[map_a]
-        idx_b = class_indices[map_b]
-        n = min(n_coords, len(idx_a), len(idx_b))
-        if n < 2:
-            continue
-
-        # Skip pairs that share a satellite centroid (identical conditioning).
-        # For these pairs pred_a == pred_b by construction, so disc loss = 1.0
-        # always with zero useful gradient — it just fights the MSE loss.
-        cos_sim = F.cosine_similarity(
-            text_embs[idx_a[0]].unsqueeze(0),
-            text_embs[idx_b[0]].unsqueeze(0),
-        ).item()
-        if cos_sim > 0.95:
-            continue
-
-        # Random subset of coordinates
-        sel_a = idx_a[torch.randperm(len(idx_a))[:n]]
-        sel_b = idx_b[torch.randperm(len(idx_b))[:n]]
-
-        # Use coordinates from class A, query with both text embeddings
-        shared_coords = coords[sel_a]
-        pred_a = model(shared_coords, text_embs[sel_a])
-        pred_b = model(shared_coords, text_embs[sel_b])
-
-        # 1/(1+|diff|) — penalizes similarity, good gradients everywhere
-        diff = (pred_a - pred_b).abs()
-        total_loss = total_loss + (1.0 / (1.0 + diff)).mean()
-        n_pairs_done += 1
-
-    if n_pairs_done == 0:
-        return torch.tensor(0.0, device=coords.device)
-    return total_loss / n_pairs_done
-
 
 def split_pairs_by_class(pairs, val_fraction=0.2, seed=42):
     """Hold out entire classes for validation.
@@ -1137,7 +1110,7 @@ def pretrain_qwen_classifier(text_encoder, raw_texts, pairs, cfg, device="cuda")
 
 def train(model, train_sampler, cfg, device="cuda", sample_pairs=None,
           val_sampler=None, bridge=None):
-    """Training loop with GPU-native sampling, AMP, discrimination loss,
+    """Training loop with GPU-native sampling, AMP, FiLM contrastive loss,
     and optional TextToSatBridge for zero-shot text inference.
 
     Stages:
@@ -1160,7 +1133,7 @@ def train(model, train_sampler, cfg, device="cuda", sample_pairs=None,
     ckpt_path = Path(cfg.output_dir) / "checkpoint_v2.pt"
     start_epoch = 0
     epoch_losses, val_losses = [], []
-    disc_losses, align_losses = [], []
+    align_losses, film_losses = [], []
     saved_opt, saved_sched = None, None
 
     if ckpt_path.exists():
@@ -1176,8 +1149,8 @@ def train(model, train_sampler, cfg, device="cuda", sample_pairs=None,
             start_epoch = ckpt["epoch"] + 1
             epoch_losses = ckpt.get("losses", [])
             val_losses = ckpt.get("val_losses", [])
-            disc_losses = ckpt.get("disc_losses", [])
             align_losses = ckpt.get("align_losses", [])
+            film_losses = ckpt.get("film_losses", [])
             print(f"  Resuming from epoch {start_epoch}")
         except (RuntimeError, KeyError) as e:
             print(f"  [warn] Checkpoint incompatible (architecture changed) — starting fresh")
@@ -1227,8 +1200,8 @@ def train(model, train_sampler, cfg, device="cuda", sample_pairs=None,
     bridge_active = bridge is not None and train_sampler.qwen_sent_embs is not None
     print(f"\nTraining: {n_params:,} spatial params, {train_sampler.samples_per_epoch:,} samples/epoch")
     print(f"  {n_batches_per_epoch} batches/epoch × {cfg.batch_size:,} = {n_batches_per_epoch * cfg.batch_size:,} samples")
-    print(f"  Discrimination weight: {cfg.discrimination_weight}")
     print(f"  Sat embedding dropout: {cfg.text_dropout}")
+    print(f"  FiLM contrastive: weight={cfg.film_contrastive_weight}, warmup={cfg.film_contrastive_warmup}")
     print(f"  Bridge: {'ON (starts epoch ' + str(cfg.bridge_start_epoch) + ')' if bridge_active else 'OFF'}")
     print(f"  AMP: bfloat16")
 
@@ -1237,7 +1210,7 @@ def train(model, train_sampler, cfg, device="cuda", sample_pairs=None,
         bridge.train()
 
     for epoch in range(start_epoch, cfg.n_epochs):
-        ep_mse, ep_disc, ep_align = 0.0, 0.0, 0.0
+        ep_mse, ep_align, ep_film = 0.0, 0.0, 0.0
         use_bridge_this_epoch = (
             bridge_active and epoch >= cfg.bridge_start_epoch
         )
@@ -1266,23 +1239,17 @@ def train(model, train_sampler, cfg, device="cuda", sample_pairs=None,
 
             # --- Forward with AMP ---
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                preds = model(coords, cond_embs)
+                use_film_loss = (cfg.film_contrastive_weight > 0
+                                 and epoch >= cfg.film_contrastive_warmup)
+                preds, film_acts = model(coords, cond_embs, return_film_acts=True)
                 class_w = train_sampler.class_weights[map_indices]
                 signal_w = 1.0 + 4.0 * targets
                 mse_loss = (class_w * signal_w * (preds - targets) ** 2).mean()
 
-                disc_loss = compute_discrimination_loss(
-                    model, coords, cond_embs, map_indices, n_coords=32
-                )
-
-                if epoch < cfg.disc_warmup_epochs:
-                    disc_w = 0.0
-                elif epoch < cfg.disc_warmup_epochs + cfg.disc_ramp_epochs:
-                    disc_w = cfg.discrimination_weight * (
-                        (epoch - cfg.disc_warmup_epochs) / cfg.disc_ramp_epochs
-                    )
-                else:
-                    disc_w = cfg.discrimination_weight
+                # FiLM contrastive loss
+                film_loss = torch.tensor(0.0, device=device)
+                if use_film_loss:
+                    film_loss = film_contrastive_loss(film_acts, map_indices)
 
                 # Bridge alignment loss: cosine distance between bridge output
                 # and per-class satellite centroids (computed on unique classes)
@@ -1296,7 +1263,8 @@ def train(model, train_sampler, cfg, device="cuda", sample_pairs=None,
                         1 - F.cosine_similarity(bridge_out, s_avg, dim=-1)
                     ).mean()
 
-                loss = (mse_loss + disc_w * disc_loss
+                loss = (mse_loss
+                        + cfg.film_contrastive_weight * film_loss
                         + cfg.bridge_weight * align_loss)
 
             optimizer.zero_grad()
@@ -1308,21 +1276,21 @@ def train(model, train_sampler, cfg, device="cuda", sample_pairs=None,
             scheduler.step()
 
             ep_mse += mse_loss.item()
-            ep_disc += disc_loss.item()
+            ep_film += film_loss.item()
             ep_align += align_loss.item()
 
             pbar.set_postfix({
                 "mse": f"{ep_mse/(batch_i+1):.4f}",
-                "disc": f"{ep_disc/(batch_i+1):.4f}",
+                "film": f"{ep_film/(batch_i+1):.4f}",
                 "align": f"{ep_align/(batch_i+1):.4f}",
                 "lr": f"{optimizer.param_groups[0]['lr']:.1e}",
             })
 
         avg_mse = ep_mse / n_batches_per_epoch
-        avg_disc = ep_disc / n_batches_per_epoch
+        avg_film = ep_film / n_batches_per_epoch
         avg_align = ep_align / n_batches_per_epoch
         epoch_losses.append(avg_mse)
-        disc_losses.append(avg_disc)
+        film_losses.append(avg_film)
         align_losses.append(avg_align)
 
         # --- Validation (always uses satellite embeddings) ---
@@ -1347,9 +1315,9 @@ def train(model, train_sampler, cfg, device="cuda", sample_pairs=None,
         lr_now = optimizer.param_groups[0]['lr']
         if (epoch + 1) % 10 == 0 or epoch == 0:
             val_str = f", val={avg_val:.5f}" if not math.isnan(avg_val) else ""
+            film_str = f", film={avg_film:.4f}" if cfg.film_contrastive_weight > 0 else ""
             align_str = f", align={avg_align:.4f}" if use_bridge_this_epoch else ""
-            print(f"Epoch {epoch+1:4d}: mse={avg_mse:.5f}, disc={avg_disc:.5f}"
-                  f"{align_str}{val_str}, lr={lr_now:.2e}")
+            print(f"Epoch {epoch+1:4d}: mse={avg_mse:.5f}{film_str}{align_str}{val_str}, lr={lr_now:.2e}")
 
         # --- Visualization + checkpoint ---
         if cfg.plot_every > 0 and ((epoch + 1) % cfg.plot_every == 0 or epoch == 0):
@@ -1363,13 +1331,16 @@ def train(model, train_sampler, cfg, device="cuda", sample_pairs=None,
             axes[0].plot(epoch_losses, linewidth=1.5, label="train MSE")
             if val_losses:
                 axes[0].plot(val_losses, linewidth=1.5, linestyle="--", label="val MSE")
-            if disc_losses:
+            aux_lines = []
+            if any(f > 0 for f in film_losses):
+                aux_lines.append(("film", film_losses, "coral"))
+            if any(a > 0 for a in align_losses):
+                aux_lines.append(("align", align_losses, "steelblue"))
+            if aux_lines:
                 ax2 = axes[0].twinx()
-                ax2.plot(disc_losses, linewidth=1.2, color="coral", alpha=0.7, label="disc")
-                if any(a > 0 for a in align_losses):
-                    ax2.plot(align_losses, linewidth=1.2, color="steelblue",
-                             alpha=0.7, label="align")
-                ax2.set_ylabel("Disc / Align", fontsize=8)
+                for name, vals, color in aux_lines:
+                    ax2.plot(vals, linewidth=1.2, color=color, alpha=0.7, label=name)
+                ax2.set_ylabel("Film / Align", fontsize=8)
                 ax2.tick_params(axis='y', labelsize=7)
             axes[0].legend(fontsize=8)
             axes[0].set_title("Loss")
@@ -1404,7 +1375,7 @@ def train(model, train_sampler, cfg, device="cuda", sample_pairs=None,
                 "scheduler": scheduler.state_dict(),
                 "losses": epoch_losses,
                 "val_losses": val_losses,
-                "disc_losses": disc_losses,
+                "film_losses": film_losses,
                 "align_losses": align_losses,
                 "config": vars(cfg),
                 "class_names": [p["class_name"] for p in (sample_pairs or [])],
