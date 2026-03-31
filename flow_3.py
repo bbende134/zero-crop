@@ -37,10 +37,11 @@ class Flow3Config:
     pairs_cache: str = "pipeline_cache/pairs_855d516e8bee.pt"
     text_descriptions_path: str = "data_corine/corine_wiki_char_count.jsonl"
     hrl_descriptions_path: str = "data_corine/hrl_wiki_char_count.jsonl"
+    query_aug_path: str = "data_corine/query_augmentations.jsonl"
     output_dir: str = "training_data_flow3"
 
     # Training
-    n_epochs: int = 10
+    n_epochs: int = 30
     lr: float = 1e-4
     batch_size: int = 32
     grad_accum_steps: int = 4       # effective batch = batch_size * grad_accum_steps
@@ -232,9 +233,11 @@ def build_datasets(pairs, raw_texts, cfg):
         torch.as_tensor(p["density_map"], dtype=torch.float32) for p in pairs
     ])  # (n_classes, H, W)
 
-    # Build sentence pool
+    # Build sentence pool — separate wiki and query-style sentences
+    # Short query-style sentences (< 50 chars) are oversampled 3x
     sentence_pool = []
     texts_by_class = {i: [] for i in range(n_classes)}
+    n_query_style = 0
     for p in pairs:
         desc_key = p.get("desc_key", p["class_name"])
         cls_idx = class_to_idx[desc_key]
@@ -242,16 +245,29 @@ def build_datasets(pairs, raw_texts, cfg):
         for s in sents:
             sentence_pool.append((s, cls_idx))
             texts_by_class[cls_idx].append(s)
+            # Oversample short query-style sentences (< 50 chars)
+            if len(s) < 50:
+                for _ in range(2):  # 3x total
+                    sentence_pool.append((s, cls_idx))
+                    texts_by_class[cls_idx].append(s)
+                n_query_style += 1
+
+    print(f"  Short query-style sentences oversampled: {n_query_style} (3x each)")
 
     # Train/val split: hold out val_fraction per class
+    # Val includes both wiki and query-style sentences for realistic eval
     rng = random.Random(42)
     train_pool, val_pool = [], []
     for cls_idx in range(n_classes):
-        sents = [(s, cls_idx) for s in texts_by_class[cls_idx]]
-        rng.shuffle(sents)
-        n_val = max(1, int(len(sents) * cfg.val_fraction))
-        val_pool.extend(sents[:n_val])
-        train_pool.extend(sents[n_val:])
+        # Deduplicate for val split to avoid inflated metrics
+        unique_sents = list(set(texts_by_class[cls_idx]))
+        rng.shuffle(unique_sents)
+        n_val = max(1, int(len(unique_sents) * cfg.val_fraction))
+        val_set = set(unique_sents[:n_val])
+        val_pool.extend([(s, cls_idx) for s in unique_sents[:n_val]])
+        # Train keeps oversampled duplicates (minus val sentences)
+        train_pool.extend([(s, cls_idx) for s in texts_by_class[cls_idx]
+                           if s not in val_set])
 
     print(f"  Classes: {n_classes}")
     print(f"  Train sentences: {len(train_pool)}, Val sentences: {len(val_pool)}")
@@ -260,8 +276,21 @@ def build_datasets(pairs, raw_texts, cfg):
     return class_names, density_maps, train_pool, val_pool, texts_by_class
 
 
+def _make_short_query(sentence):
+    """Extract a short 1-5 word query from a sentence (on-the-fly augmentation)."""
+    words = sentence.split()
+    if len(words) <= 2:
+        return sentence
+    n = random.randint(1, min(5, len(words)))
+    start = random.randint(0, len(words) - n)
+    return " ".join(words[start:start + n])
+
+
 def sample_batch(train_pool, texts_by_class, n_classes, cfg):
     """Build a mixed batch: single-class + synthetic multi-class + negatives.
+
+    ~20% of single-class samples are converted to short keyword queries
+    to bridge the gap between wiki-style training text and real user queries.
 
     Returns:
         texts:  List[str] of length batch_size
@@ -275,9 +304,11 @@ def sample_batch(train_pool, texts_by_class, n_classes, cfg):
     texts = []
     labels = torch.zeros(bs, n_classes)
 
-    # Single-class samples
+    # Single-class samples (20% converted to short keyword queries)
     for i in range(n_single):
         sent, cls_idx = random.choice(train_pool)
+        if random.random() < 0.2:
+            sent = _make_short_query(sent)
         texts.append(sent)
         labels[i, cls_idx] = 1.0
 
@@ -458,7 +489,7 @@ def train(model, text_encoder, density_maps, class_names,
             with torch.autocast(qwen_device.type, dtype=torch.bfloat16):
                 embs = text_encoder(input_ids, attn_mask)
                 logits = model(embs.to(device))
-                loss = loss_fn(logits, labels) / cfg.grad_accum_steps
+                loss = loss_fn(logits, labels.to(logits.device)) / cfg.grad_accum_steps
 
             loss.backward()
 
@@ -472,10 +503,11 @@ def train(model, text_encoder, density_maps, class_names,
             # Accuracy on single-class samples only
             with torch.no_grad():
                 preds = (torch.sigmoid(logits) > 0.5).float()
-                single_mask = (labels.sum(dim=-1) == 1)
+                labels_dev = labels.to(logits.device)
+                single_mask = (labels_dev.sum(dim=-1) == 1)
                 if single_mask.any():
                     n_correct += (preds[single_mask].argmax(dim=-1) ==
-                                  labels[single_mask].argmax(dim=-1)).sum().item()
+                                  labels_dev[single_mask].argmax(dim=-1)).sum().item()
                     n_total += single_mask.sum().item()
 
             pbar.set_postfix({
@@ -511,11 +543,11 @@ def train(model, text_encoder, density_maps, class_names,
                 with torch.autocast(qwen_device.type, dtype=torch.bfloat16):
                     embs_v = text_encoder(input_ids_v, attn_mask_v)
                     logits_v = model(embs_v.to(device))
-                    v_loss_sum += loss_fn(logits_v, labels_v).item()
+                    v_loss_sum += loss_fn(logits_v, labels_v.to(logits_v.device)).item()
                     v_batches += 1
 
                 preds_v = logits_v.argmax(dim=-1)
-                targets_v = labels_v.argmax(dim=-1)
+                targets_v = labels_v.to(logits_v.device).argmax(dim=-1)
                 v_correct += (preds_v == targets_v).sum().item()
                 v_total += len(batch)
 
@@ -840,7 +872,7 @@ def main():
     print("=" * 60)
     raw_texts = load_raw_texts(
         cfg.text_descriptions_path,
-        extra_paths=[cfg.hrl_descriptions_path],
+        extra_paths=[cfg.hrl_descriptions_path, cfg.query_aug_path],
     )
 
     # --- Step 3: Build datasets ---
