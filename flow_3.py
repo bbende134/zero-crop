@@ -12,6 +12,7 @@ Training data: ~45% single-class sentences, ~50% synthetic multi-class
 (concatenated with random separators), ~5% OOD negatives (all-zeros target).
 """
 
+import hashlib
 import json
 import random
 import argparse
@@ -19,7 +20,7 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List
 
 import matplotlib
@@ -31,10 +32,15 @@ import matplotlib.pyplot as plt
 # CONFIGURATION
 # ============================================================
 
+def _cfg_hash(*parts) -> str:
+    blob = "|".join(str(p) for p in parts)
+    return hashlib.md5(blob.encode()).hexdigest()[:12]
+
+
 @dataclass
 class Flow3Config:
     # Data (reuse flow_2 caches)
-    pairs_cache: str = "pipeline_cache/pairs_855d516e8bee.pt"
+    pairs_cache_dir: str = "pipeline_cache"
     text_descriptions_path: str = "data_corine/corine_wiki_char_count.jsonl"
     hrl_descriptions_path: str = "data_corine/hrl_wiki_char_count.jsonl"
     output_dir: str = "training_data_flow3"
@@ -42,7 +48,7 @@ class Flow3Config:
     # Training
     n_epochs: int = 30
     lr: float = 1e-4
-    batch_size: int = 32
+    batch_size: int = 256
     val_fraction: float = 0.15
     multi_label_ratio: float = 0.50
     negative_ratio: float = 0.05
@@ -56,7 +62,21 @@ class Flow3Config:
     lon_max: float = 22.897
 
     # Qwen
-    qwen_emb_dim: int = 2560
+    qwen_model_id: str = "Qwen/Qwen3.5-9B"
+    qwen_emb_dim: int = 4096
+    lora_r: int = 32
+    lora_alpha: int = 64
+
+    @property
+    def pairs_cache(self) -> str:
+        # Match flow_2.py's hash: _cfg_hash(dist_hash, text, hrl, qwen_emb_dim)
+        # Derive dist_hash from the distributions cache file present on disk.
+        dist_files = sorted(Path(self.pairs_cache_dir).glob("distributions_*.pkl"))
+        if not dist_files:
+            raise FileNotFoundError(f"No distributions cache in {self.pairs_cache_dir} — run flow_2.py first")
+        dist_hash = dist_files[0].stem.split("_", 1)[1]
+        h = _cfg_hash(dist_hash, self.text_descriptions_path, self.hrl_descriptions_path, self.qwen_emb_dim)
+        return f"{self.pairs_cache_dir}/pairs_{h}.pt"
 
 
 # ============================================================
@@ -176,7 +196,7 @@ def load_raw_texts(descriptions_path, extra_paths=None, filter_relevance=True):
 # ============================================================
 
 class TextClassifier(nn.Module):
-    def __init__(self, n_classes: int = 40, qwen_dim: int = 2560):
+    def __init__(self, n_classes: int = 40, qwen_dim: int = 4096):
         super().__init__()
         self.head = nn.Sequential(
             nn.LayerNorm(qwen_dim),
@@ -594,8 +614,11 @@ def main():
     from fine_tune.qwen3_adapter import Qwen3EmbeddingAdapter
     text_encoder = Qwen3EmbeddingAdapter(
         target_dim=cfg.qwen_emb_dim,
+        pretrained_encoder_path=cfg.qwen_model_id,
         freeze_encoder=True,    # freeze base, LoRA adapters are trainable
         lora=True,
+        lora_r=cfg.lora_r,
+        lora_alpha=cfg.lora_alpha,
     )
     text_encoder = text_encoder.to(device)
     print(f"  Qwen3 loaded on {device}")

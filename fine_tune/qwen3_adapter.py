@@ -1,8 +1,8 @@
 """
 Qwen3EmbeddingAdapter
 =====================
-Wraps Qwen/Qwen3.5-4B as a text encoder via last-token pooling.
-Output dim = 2560 (matches Qwen3.5-4B hidden size).
+Wraps Qwen/Qwen3.5-9B as a text encoder via last-token pooling.
+Output dim = 4096 (matches Qwen3.5-9B hidden size).
 
 Supports:
   - Frozen mode (precompute embeddings)
@@ -24,8 +24,8 @@ import torch.nn as nn
 from typing import Optional, List
 
 
-MODEL_ID = "Qwen/Qwen3.5-4B"
-HIDDEN_DIM = 2560
+MODEL_ID = "Qwen/Qwen3.5-9B"
+HIDDEN_DIM = 4096
 
 
 class Qwen3EmbeddingAdapter(nn.Module):
