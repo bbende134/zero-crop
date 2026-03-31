@@ -70,7 +70,7 @@ class Config:
     seed: int = 42
     dpi: int = 300
     device: str = "cuda:0"
-    max_workers: int = 8
+    max_workers: int = 4
     umap_subsample: int = 20000
     sim_subsample_per_class: int = 500
     spatial_pca_classes: List[str] = field(default_factory=lambda: ["211", "311", "512", "112"])
@@ -110,32 +110,59 @@ def connect_milvus(cfg: Config) -> Collection:
     return coll
 
 
-def query_tile(coll_name: str, host: str, port: str, lat0: float, lat1: float,
-               lon0: float, lon1: float, emb_field: str, page_size: int = 16384) -> List[dict]:
-    """Query a single tile from Milvus with iterative offset pagination."""
-    try:
-        conn_alias = f"tile_{lat0:.3f}_{lon0:.3f}"
-        connections.connect(alias=conn_alias, host=host, port=port)
-        coll = Collection(coll_name, using=conn_alias)
+import threading
+_thread_local = threading.local()
+
+def _get_thread_collection(coll_name: str, host: str, port: str) -> Collection:
+    """Return a per-thread cached Collection, creating the connection once per thread."""
+    if not hasattr(_thread_local, "coll") or _thread_local.coll is None:
+        thread_id = threading.get_ident()
+        alias = f"worker_{thread_id}"
+        try:
+            connections.disconnect(alias)
+        except Exception:
+            pass
+        connections.connect(alias=alias, host=host, port=port)
+        coll = Collection(coll_name, using=alias)
         coll.load()
+        _thread_local.coll = coll
+    return _thread_local.coll
+
+
+def query_tile(coll_name: str, host: str, port: str, lat0: float, lat1: float,
+               lon0: float, lon1: float, emb_field: str, page_size: int = 1000) -> List[dict]:
+    """Query a single tile using a persistent per-thread connection."""
+    try:
+        coll = _get_thread_collection(coll_name, host, port)
         expr = (f"lat >= {lat0} && lat < {lat1} && "
                 f"lon >= {lon0} && lon < {lon1}")
-        all_results = []
-        offset = 0
-        while True:
-            batch = coll.query(
-                expr=expr, output_fields=[emb_field, "lat", "lon"],
-                limit=page_size, offset=offset,
-            )
-            all_results.extend(batch)
-            if len(batch) < page_size:
-                break
-            offset += page_size
-        connections.disconnect(conn_alias)
-        return all_results
+        return coll.query(
+            expr=expr,
+            output_fields=[emb_field, "lat", "lon"],
+            limit=16384,
+            timeout=30,
+        )
     except Exception as e:
         print(f"  Tile ({lat0:.2f},{lon0:.2f}) failed: {e}")
+        _thread_local.coll = None
         return []
+
+
+def _query_and_write_tile(coll_name: str, host: str, port: str,
+                          lat0: float, lat1: float, lon0: float, lon1: float,
+                          emb_field: str, chunk_path: str) -> int:
+    """Query one tile and write results directly to a parquet file. Returns row count."""
+    results = query_tile(coll_name, host, port, lat0, lat1, lon0, lon1, emb_field)
+    if not results:
+        return 0
+    lats = np.array([r["lat"] for r in results], dtype=np.float32)
+    lons = np.array([r["lon"] for r in results], dtype=np.float32)
+    vecs = np.array([r[emb_field] for r in results], dtype=np.float32)
+    data = {"lat": lats, "lon": lons}
+    for d in range(vecs.shape[1]):
+        data[f"v{d}"] = vecs[:, d]
+    pd.DataFrame(data).to_parquet(chunk_path, index=False)
+    return len(results)
 
 
 def collect_embeddings_tiled(cfg: Config) -> pd.DataFrame:
@@ -151,29 +178,39 @@ def collect_embeddings_tiled(cfg: Config) -> pd.DataFrame:
              for i in range(len(lat_edges) - 1) for j in range(len(lon_edges) - 1)]
     print(f"Querying {len(tiles)} tiles from Milvus ({cfg.collection})...")
 
-    all_rows = []
+    chunk_dir = Path(cfg.output_dir) / "_chunks"
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+
+    total = 0
+    chunk_files = []
+
     with ThreadPoolExecutor(max_workers=cfg.max_workers) as pool:
         futures = {
             pool.submit(
-                query_tile, cfg.collection, cfg.milvus_host, cfg.milvus_port,
+                _query_and_write_tile,
+                cfg.collection, cfg.milvus_host, cfg.milvus_port,
                 t[0], t[1], t[2], t[3], cfg.embedding_field,
-            ): t for t in tiles
+                str(chunk_dir / f"chunk_{i:05d}.parquet"),
+            ): i for i, t in enumerate(tiles)
         }
         for fut in tqdm(as_completed(futures), total=len(futures), desc="Milvus tiles"):
-            results = fut.result()
-            for r in results:
-                vec = r[cfg.embedding_field]
-                row = {"lat": r["lat"], "lon": r["lon"]}
-                for d in range(len(vec)):
-                    row[f"v{d}"] = vec[d]
-                all_rows.append(row)
+            n = fut.result()
+            if n > 0:
+                tile_idx = futures[fut]
+                chunk_files.append(chunk_dir / f"chunk_{tile_idx:05d}.parquet")
+            total += n
 
-    df = pd.DataFrame(all_rows)
-    print(f"Collected {len(df)} embeddings")
+    print(f"Collected {total} embeddings, merging {len(chunk_files)} chunks...")
+    chunk_files = sorted(chunk_files)
+    df = pd.concat([pd.read_parquet(f) for f in chunk_files], ignore_index=True)
 
     Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
     df.to_parquet(cache, index=False)
     print(f"Cached to {cache}")
+
+    import shutil
+    shutil.rmtree(chunk_dir, ignore_errors=True)
+
     return df
 
 
