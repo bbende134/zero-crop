@@ -76,7 +76,9 @@ class Qwen3EmbeddingAdapter(nn.Module):
             )
             self._model = get_peft_model(self._model, lora_config)
             self._model.print_trainable_parameters()
-            # Gradient checkpointing: trade compute for memory
+            # Gradient checkpointing: trade compute for memory.
+            # Must disable KV cache — incompatible with gradient checkpointing.
+            self._model.config.use_cache = False
             self._model.gradient_checkpointing_enable()
             print(f"[Qwen3EmbeddingAdapter] Gradient checkpointing enabled")
 
@@ -103,7 +105,7 @@ class Qwen3EmbeddingAdapter(nn.Module):
         out = self._model(input_ids=input_ids, attention_mask=attention_mask)
         emb = self._last_token_pool(out.last_hidden_state, attention_mask)
         if self._projection is not None:
-            emb = self._projection(emb)
+            emb = self._projection(emb.to(self._projection.weight.dtype))
         return emb
 
     def encode_raw(self, text: str, normalize: bool = False) -> torch.Tensor:

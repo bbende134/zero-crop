@@ -72,7 +72,7 @@ class PipelineConfig:
     bridge_lr: float = 1e-4
 
     # --- Qwen (frozen, used only for bridge training) ---
-    qwen_emb_dim: int = 2560        # Qwen3 hidden dim — bridge input
+    qwen_emb_dim: int = 4096        # Qwen3.5-9B hidden dim — bridge input
 
     # --- Training ---
     n_epochs: int = 400

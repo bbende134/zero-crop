@@ -48,7 +48,7 @@ class Flow3Config:
     # Training
     n_epochs: int = 30
     lr: float = 1e-4
-    batch_size: int = 256
+    batch_size: int = 64
     val_fraction: float = 0.15
     multi_label_ratio: float = 0.50
     negative_ratio: float = 0.05
@@ -572,6 +572,9 @@ def train(model, text_encoder, density_maps, class_names,
 # ============================================================
 
 def main():
+    import os
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", default=None)
     parser.add_argument("--output-dir", default=None)
