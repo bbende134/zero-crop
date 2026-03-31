@@ -31,7 +31,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from flow_3 import load_raw_texts
+from flow_3 import load_raw_texts, _KEEP_PATTERNS, _DROP_PATTERNS
 
 
 # ============================================================
@@ -41,11 +41,11 @@ from flow_3 import load_raw_texts
 @dataclass
 class Flow4Config:
     # Data
-    pairs_cache: str = "pipeline_cache/pairs_855d516e8bee.pt"
+    pairs_cache: str = "pipeline_cache/pairs_266240ae3497.pt"
     sat_grid_path: str = "pipeline_cache/sat_grid_1dffdd1c79c3.npy"
     text_descriptions_path: str = "data_corine/corine_wiki_char_count.jsonl"
     hrl_descriptions_path: str = "data_corine/hrl_wiki_char_count.jsonl"
-    output_dir: str = "training_data_flow4"
+    output_dir: str = "training_data_flow4_v3"
 
     # Satellite
     sat_emb_dim: int = 64
@@ -57,14 +57,16 @@ class Flow4Config:
     # Contrastive
     init_temperature: float = 0.07
     pixel_loss_weight: float = 0.25
+    density_loss_weight: float = 1.0
+    distractor_loss_weight: float = 0.1
     n_pos_pixels: int = 64
     n_neg_pixels: int = 64
 
     # Training
     n_epochs: int = 50
     lr: float = 1e-4
-    batch_size: int = 40  # = all classes per step
-    grad_accum_steps: int = 4
+    batch_size: int = 256 # = all classes per step
+    grad_accum_steps: int = 2
     val_fraction: float = 0.15
     plot_every: int = 5
 
@@ -75,7 +77,7 @@ class Flow4Config:
     lon_max: float = 22.897
 
     # Qwen
-    qwen_model_id: str = "Qwen/Qwen3.5-4B"
+    qwen_model_id: str = "Qwen/Qwen3.5-9B"
     qwen_emb_dim: int = 0  # auto-detect
 
 
@@ -128,6 +130,37 @@ def centroid_infonce_loss(text_embs, sat_centroids, temperature):
     labels = torch.arange(len(text_embs), device=text_embs.device)
     loss_t2s = F.cross_entropy(logits, labels)
     loss_s2t = F.cross_entropy(logits.T, labels)
+    return (loss_t2s + loss_s2t) / 2
+
+
+def density_weighted_infonce_loss(text_embs, sat_grid_flat, density_maps_flat, temperature):
+    """Distribution-aligned InfoNCE.
+
+    Score between text_i and class_j = expected cosine similarity under class j's
+    spatial distribution:
+        score(i,j) = Σ_k [ density_j[k] * sim(text_i, sat[k]) ] / Σ_k density_j[k]
+
+    Preserves spatial spread — bimodal distributions stay bimodal instead of
+    collapsing to a geographically meaningless centroid.
+
+    text_embs:         (N, 64)   L2-normalized
+    sat_grid_flat:     (H*W, 64) L2-normalized
+    density_maps_flat: (N, H*W)  raw density values
+    temperature:       scalar
+    """
+    N = text_embs.shape[0]
+    # (N, H*W) cosine similarity of each text to every satellite cell
+    sim = text_embs @ sat_grid_flat.T
+
+    # row-normalize density maps → probability distributions
+    dm_norm = density_maps_flat / (density_maps_flat.sum(dim=1, keepdim=True) + 1e-8)
+
+    # scores[i,j] = expected sim of text_i under class_j's distribution
+    scores = (sim @ dm_norm.T) * temperature  # (N, N)
+
+    labels = torch.arange(N, device=text_embs.device)
+    loss_t2s = F.cross_entropy(scores, labels)
+    loss_s2t = F.cross_entropy(scores.T, labels)
     return (loss_t2s + loss_s2t) / 2
 
 
@@ -189,6 +222,31 @@ def pixel_contrastive_loss(text_embs, sat_grid_flat, density_maps_flat,
     return torch.stack(losses).mean()
 
 
+def _is_distractor(text: str) -> bool:
+    """True only if the sentence matches drop patterns WITHOUT any keep pattern.
+
+    Sentences matching both (e.g. 'wheat exports from Hungary') are treated as
+    relevant — the keep signal wins.
+    """
+    t = text.lower()
+    if not any(p in t for p in _DROP_PATTERNS):
+        return False
+    return not any(p in t for p in _KEEP_PATTERNS)
+
+
+def distractor_uniformity_loss(projected_distractors, sat_grid_flat, temperature):
+    """Penalize distractor embeddings for producing peaked geographic distributions.
+
+    Pushes cosine similarity against all satellite cells toward zero —
+    i.e., the embedding should carry no geographic signal.
+
+    projected_distractors: (D, 64) L2-normalized
+    sat_grid_flat:         (H*W, 64) L2-normalized
+    """
+    sim = (projected_distractors @ sat_grid_flat.T) * temperature  # (D, H*W)
+    return sim.pow(2).mean()
+
+
 # ============================================================
 # DATA
 # ============================================================
@@ -202,7 +260,8 @@ def compute_sat_centroids(pairs, sat_grid):
     sat_flat = sat_grid.reshape(H * W, D).astype(np.float64)
     centroids = []
     for p in pairs:
-        dm = p["density_map"].numpy().flatten().astype(np.float64)
+        dm_raw = p["density_map"]
+        dm = (dm_raw.numpy() if hasattr(dm_raw, "numpy") else np.asarray(dm_raw)).flatten().astype(np.float64)
         w_sum = dm.sum()
         if w_sum < 1e-8:
             c = sat_flat.mean(axis=0)
@@ -211,6 +270,52 @@ def compute_sat_centroids(pairs, sat_grid):
         c = c / (np.linalg.norm(c) + 1e-8)
         centroids.append(c.astype(np.float32))
     return torch.from_numpy(np.stack(centroids))
+
+
+def _augment_neither_sentences(sents):
+    """For each 'neither' sentence, append the closest keep/both sentence from the
+    same class pool (token-overlap Jaccard). Returns the augmented list in-place.
+
+    keep/both sentences are kept unchanged. Pure distractors are kept as-is
+    (the uniformity loss handles them during training).
+    """
+    def _tokens(s):
+        return set(s.lower().split())
+
+    def _classify(s):
+        sl = s.lower()
+        has_keep = any(p in sl for p in _KEEP_PATTERNS)
+        has_drop = any(p in sl for p in _DROP_PATTERNS)
+        if has_drop and not has_keep:
+            return "drop"
+        if not has_keep and not has_drop:
+            return "neither"
+        return "keep"
+
+    keep_sents = [s for s in sents if _classify(s) == "keep"]
+    if not keep_sents:
+        return sents  # nothing to anchor to
+
+    keep_tokens = [_tokens(s) for s in keep_sents]
+
+    augmented = []
+    n_augmented = 0
+    for s in sents:
+        if _classify(s) != "neither":
+            augmented.append(s)
+            continue
+        # Jaccard similarity to each keep sentence
+        s_tok = _tokens(s)
+        best_idx, best_score = 0, -1.0
+        for i, kt in enumerate(keep_tokens):
+            union = s_tok | kt
+            if union:
+                score = len(s_tok & kt) / len(union)
+                if score > best_score:
+                    best_score, best_idx = score, i
+        augmented.append(s + ". " + keep_sents[best_idx])
+        n_augmented += 1
+    return augmented, n_augmented
 
 
 def build_datasets(pairs, raw_texts, cfg):
@@ -225,7 +330,7 @@ def build_datasets(pairs, raw_texts, cfg):
     n_classes = len(class_names)
 
     density_maps = torch.stack([
-        torch.as_tensor(p["density_map"], dtype=torch.float32) for p in pairs
+        torch.as_tensor(np.asarray(p["density_map"]), dtype=torch.float32) for p in pairs
     ])
 
     # Build per-class text pools
@@ -235,6 +340,15 @@ def build_datasets(pairs, raw_texts, cfg):
         cls_idx = class_to_idx[desc_key]
         sents = raw_texts.get(desc_key, [f"{p['class_name']} in Hungary"])
         texts_by_class[cls_idx].extend(sents)
+
+    # Augment 'neither' sentences with their closest keep sentence
+    total_augmented = 0
+    for cls_idx in range(n_classes):
+        result = _augment_neither_sentences(texts_by_class[cls_idx])
+        if isinstance(result, tuple):
+            texts_by_class[cls_idx], n_aug = result
+            total_augmented += n_aug
+    print(f"  Neither-sentences augmented: {total_augmented}")
 
     # Train/val split
     rng = random.Random(42)
@@ -271,7 +385,7 @@ def sample_contrastive_batch(texts_by_class, n_classes):
 
 def visualize_predictions(proj_head, text_encoder, sat_grid_flat_norm,
                           density_maps, class_names, queries, cfg,
-                          epoch, viz_dir, device):
+                          epoch, viz_dir, device, hungary_mask=None):
     """Render cosine similarity maps for test queries."""
     proj_head.eval()
     H, W = density_maps.shape[1], density_maps.shape[2]
@@ -288,20 +402,30 @@ def visualize_predictions(proj_head, text_encoder, sat_grid_flat_norm,
             projected = proj_head(emb.to(device))  # (1, 64)
             sim = (projected @ sat_grid_flat_norm.T)[0]  # (H*W,)
             sim_map = sim.reshape(H, W).cpu().numpy()
-            density = sim_map.clip(0, 1)
+            if hungary_mask is not None:
+                sim_map[~hungary_mask] = np.nan
+            density = np.where(hungary_mask if hungary_mask is not None else True,
+                               sim_map.clip(0, 1), np.nan)
 
             # Heatmap
             ax = axes[row, 0]
-            im = ax.imshow(density, cmap="YlOrRd", origin="upper",
+            cmap = plt.cm.YlOrRd.copy()
+            cmap.set_bad(color="lightgrey")   # outside Hungary = grey
+            im = ax.imshow(density, cmap=cmap, origin="upper",
                            extent=extent, vmin=0, vmax=0.5)
             ax.set_title(f'"{query[:50]}"', fontsize=9)
             ax.axis("off")
 
-            # Histogram of similarities
+            # Histogram: only inside-Hungary cells
+            sim_np = sim.cpu().numpy()
+            if hungary_mask is not None:
+                sim_inside = sim_np[hungary_mask.ravel()]
+            else:
+                sim_inside = sim_np
             ax2 = axes[row, 1]
-            ax2.hist(sim.cpu().numpy(), bins=50, color="steelblue", alpha=0.7)
+            ax2.hist(sim_inside, bins=50, color="steelblue", alpha=0.7)
             ax2.axvline(0, color="red", linestyle="--", alpha=0.5)
-            ax2.set_title(f"sim distribution (mean={sim.mean():.3f})", fontsize=9)
+            ax2.set_title(f"sim distribution (mean={sim_inside.mean():.3f})", fontsize=9)
             ax2.set_xlim(-0.3, 0.5)
 
     plt.suptitle(f"Epoch {epoch}", fontsize=11)
@@ -316,44 +440,57 @@ def visualize_predictions(proj_head, text_encoder, sat_grid_flat_norm,
 # ============================================================
 
 def validate(proj_head, text_encoder, sat_centroids, val_texts,
-             n_classes, device):
-    """Compute retrieval R@1 and R@5 on validation texts."""
+             n_classes, device, max_per_class: int = 3, batch_size: int = 40):
+    """Compute retrieval R@1 and R@5 on validation texts (batched)."""
     proj_head.eval()
-    correct_1, correct_5, total = 0, 0, 0
     tokenizer = text_encoder._tokenizer
     qwen_device = text_encoder.input_device
 
+    # Collect (sentence, class_idx) pairs, capped per class
+    all_sents, all_labels = [], []
+    for cls_idx in range(n_classes):
+        for sent in val_texts[cls_idx][:max_per_class]:
+            all_sents.append(sent)
+            all_labels.append(cls_idx)
+
+    correct_1, correct_5 = 0, 0
+
     with torch.no_grad():
-        for cls_idx in range(n_classes):
-            for sent in val_texts[cls_idx]:
-                inputs = tokenizer(
-                    [sent], return_tensors="pt",
-                    truncation=True, max_length=512, padding=True,
-                )
-                ids = inputs["input_ids"].to(qwen_device)
-                mask = inputs["attention_mask"].to(qwen_device)
+        for start in range(0, len(all_sents), batch_size):
+            batch_sents = all_sents[start:start + batch_size]
+            batch_labels = all_labels[start:start + batch_size]
 
-                with torch.autocast(qwen_device.type, dtype=torch.bfloat16):
-                    emb = text_encoder(ids, mask)
-                    projected = proj_head(emb.to(device))  # (1, 64)
+            inputs = tokenizer(
+                batch_sents, return_tensors="pt",
+                truncation=True, max_length=512, padding=True,
+            )
+            ids = inputs["input_ids"].to(qwen_device)
+            mask = inputs["attention_mask"].to(qwen_device)
 
-                sim = (projected @ sat_centroids.T)[0]  # (n_classes,)
-                top5 = sim.topk(5).indices.tolist()
+            with torch.autocast(qwen_device.type, dtype=torch.bfloat16):
+                embs = text_encoder(ids, mask)
+                projected = proj_head(embs.to(device))  # (B, 64)
 
+            sims = projected @ sat_centroids.T  # (B, n_classes)
+            top5s = sims.topk(5).indices  # (B, 5)
+
+            for i, cls_idx in enumerate(batch_labels):
+                top5 = top5s[i].tolist()
                 if cls_idx == top5[0]:
                     correct_1 += 1
                 if cls_idx in top5:
                     correct_5 += 1
-                total += 1
 
     proj_head.train()
+    total = len(all_sents)
     r1 = correct_1 / max(1, total) * 100
     r5 = correct_5 / max(1, total) * 100
     return r1, r5
 
 
 def train(proj_head, temperature, text_encoder, sat_centroids, sat_grid_flat_norm,
-          density_maps, class_names, train_texts, val_texts, cfg, device):
+          density_maps, class_names, train_texts, val_texts, cfg, device,
+          hungary_mask=None):
     """Main training loop."""
 
     n_classes = len(class_names)
@@ -429,13 +566,16 @@ def train(proj_head, temperature, text_encoder, sat_centroids, sat_grid_flat_nor
     for epoch in range(start_epoch, cfg.n_epochs):
         ep_loss = 0.0
         ep_centroid_loss = 0.0
+        ep_density_loss = 0.0
         ep_pixel_loss = 0.0
+        ep_distractor_loss = 0.0
 
         pbar = tqdm(range(n_batches), desc=f"Epoch {epoch+1:3d}",
                     leave=False, ncols=100)
 
         for batch_i in pbar:
             texts, class_indices = sample_contrastive_batch(train_texts, n_classes)
+            distractor_mask = torch.tensor([_is_distractor(t) for t in texts])
             class_indices = class_indices.to(device)
 
             inputs = tokenizer(
@@ -451,11 +591,23 @@ def train(proj_head, temperature, text_encoder, sat_centroids, sat_grid_flat_nor
                 temp = temperature()
 
                 loss_c = centroid_infonce_loss(projected, sat_centroids_dev, temp)
+                loss_dw = density_weighted_infonce_loss(
+                    projected, sat_grid_flat_dev, dm_flat, temp)
                 loss_p = pixel_contrastive_loss(
                     projected, sat_grid_flat_dev, dm_flat,
                     class_indices, cfg.n_pos_pixels, cfg.n_neg_pixels, temp)
 
-                loss = (loss_c + cfg.pixel_loss_weight * loss_p) / cfg.grad_accum_steps
+                distractor_idx = distractor_mask.nonzero(as_tuple=True)[0].to(device)
+                if len(distractor_idx) > 0:
+                    loss_d = distractor_uniformity_loss(
+                        projected[distractor_idx], sat_grid_flat_dev, temp)
+                else:
+                    loss_d = torch.tensor(0.0, device=device)
+
+                loss = (loss_c
+                        + cfg.density_loss_weight * loss_dw
+                        + cfg.pixel_loss_weight * loss_p
+                        + cfg.distractor_loss_weight * loss_d) / cfg.grad_accum_steps
 
             loss.backward()
 
@@ -467,16 +619,21 @@ def train(proj_head, temperature, text_encoder, sat_centroids, sat_grid_flat_nor
 
             ep_loss += loss.item() * cfg.grad_accum_steps
             ep_centroid_loss += loss_c.item()
+            ep_density_loss += loss_dw.item()
             ep_pixel_loss += loss_p.item()
+            ep_distractor_loss += loss_d.item()
 
             pbar.set_postfix({
                 "loss": f"{ep_loss/(batch_i+1):.4f}",
+                "dw": f"{ep_density_loss/(batch_i+1):.4f}",
                 "temp": f"{temp.item():.2f}",
             })
 
         avg_loss = ep_loss / n_batches
         avg_c = ep_centroid_loss / n_batches
+        avg_dw = ep_density_loss / n_batches
         avg_p = ep_pixel_loss / n_batches
+        avg_d = ep_distractor_loss / n_batches
         cur_temp = temperature().item()
         train_losses.append(avg_loss)
         temps.append(cur_temp)
@@ -488,7 +645,8 @@ def train(proj_head, temperature, text_encoder, sat_centroids, sat_grid_flat_nor
         val_r5s.append(r5)
 
         print(f"Epoch {epoch+1:3d}: loss={avg_loss:.4f} (centroid={avg_c:.4f}, "
-              f"pixel={avg_p:.4f}), R@1={r1:.1f}%, R@5={r5:.1f}%, temp={cur_temp:.2f}")
+              f"density_w={avg_dw:.4f}, pixel={avg_p:.4f}, distractor={avg_d:.4f}), "
+              f"R@1={r1:.1f}%, R@5={r5:.1f}%, temp={cur_temp:.2f}")
 
         # --- Progress plot ---
         fig, axes = plt.subplots(1, 3, figsize=(18, 5))
@@ -524,7 +682,8 @@ def train(proj_head, temperature, text_encoder, sat_centroids, sat_grid_flat_nor
             visualize_predictions(
                 proj_head, text_encoder, sat_grid_flat_dev,
                 density_maps, class_names, test_queries,
-                cfg, epoch + 1, viz_dir, device)
+                cfg, epoch + 1, viz_dir, device,
+                hungary_mask=hungary_mask)
 
         # --- Checkpoint ---
         Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
@@ -583,19 +742,95 @@ def main():
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}, multi_gpu: {multi_gpu}")
 
-    # --- Step 1: Load pairs ---
-    print("\n" + "=" * 60)
-    print("STEP 1: Load cached training pairs")
-    print("=" * 60)
-    pairs = torch.load(cfg.pairs_cache, map_location="cpu", weights_only=False)
-    print(f"  {len(pairs)} pairs loaded")
+    import data_pipeline as dp
+    from data_pipeline import (
+        build_or_load_distributions,
+        build_or_load_pairs,
+        build_or_load_sat_grid,
+    )
+    cache_dir = Path("pipeline_cache")
+    cache_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- Step 2: Load satellite grid ---
+    expected_H = dp.TARGET_RES
+    expected_W = dp.target_width(dp.TARGET_RES)
+
+    # --- Step 1: Pairs (density maps + class metadata) ---
     print("\n" + "=" * 60)
-    print("STEP 2: Load satellite embedding grid")
+    print(f"STEP 1: Pairs cache  [expected density map: {expected_H}×{expected_W}]")
     print("=" * 60)
-    sat_grid = np.load(cfg.sat_grid_path)
-    print(f"  Grid shape: {sat_grid.shape}")
+
+    def _pairs_resolution_ok(p):
+        dm = np.asarray(p[0]["density_map"])
+        return dm.shape == (expected_H, expected_W)
+
+    pairs = None
+    pairs_path = Path(cfg.pairs_cache)
+    if pairs_path.exists():
+        p = torch.load(pairs_path, map_location="cpu", weights_only=False)
+        if _pairs_resolution_ok(p):
+            pairs = p
+            print(f"  [OK]     config path: {pairs_path.name}  "
+                  f"({len(pairs)} pairs, {expected_H}×{expected_W})")
+        else:
+            dm_shape = np.asarray(p[0]["density_map"]).shape
+            print(f"  [SKIP]   config path: {pairs_path.name}  "
+                  f"wrong resolution {dm_shape} ≠ {(expected_H, expected_W)}")
+
+    if pairs is None:
+        for candidate in sorted(cache_dir.glob("pairs_*.pt"),
+                                key=lambda p: p.stat().st_mtime, reverse=True):
+            p = torch.load(candidate, map_location="cpu", weights_only=False)
+            if _pairs_resolution_ok(p):
+                pairs = p
+                print(f"  [OK]     found cache: {candidate.name}  "
+                      f"({len(pairs)} pairs, {expected_H}×{expected_W})")
+                break
+            else:
+                dm_shape = np.asarray(p[0]["density_map"]).shape
+                print(f"  [SKIP]   {candidate.name}  resolution {dm_shape}")
+
+    if pairs is None:
+        print(f"  [BUILD]  No matching pairs cache — building at {expected_H}×{expected_W}...")
+        distributions = build_or_load_distributions(cache_dir, dp.TARGET_RES)
+        dist_hash = dp._hash(
+            dp.R3_DIR, dp.R4_DIR, dp.CORINE_GEOJSON,
+            dp.LAT_MIN, dp.LAT_MAX, dp.LON_MIN, dp.LON_MAX,
+            dp.TARGET_RES, dp.MIN_PIXELS,
+        )
+        pairs = build_or_load_pairs(distributions, cache_dir, dist_hash, device)
+        print(f"  [DONE]   {len(pairs)} pairs built")
+
+    # --- Step 2: Satellite embedding grid ---
+    print("\n" + "=" * 60)
+    print(f"STEP 2: Satellite grid  [expected: {expected_H}×{expected_W}×{dp.SAT_EMB_DIM}]")
+    print("=" * 60)
+
+    sat_grid = None
+    sat_grid_path = Path(cfg.sat_grid_path)
+    if sat_grid_path.exists():
+        g = np.load(sat_grid_path, mmap_mode="r")
+        if g.shape[:2] == (expected_H, expected_W):
+            sat_grid = np.array(g)
+            print(f"  [OK]     config path: {sat_grid_path.name}  shape={sat_grid.shape}")
+        else:
+            print(f"  [SKIP]   config path: {sat_grid_path.name}  "
+                  f"wrong shape {g.shape} ≠ ({expected_H},{expected_W},...)")
+
+    if sat_grid is None:
+        for candidate in sorted(cache_dir.glob("sat_grid_*.npy"),
+                                key=lambda p: p.stat().st_mtime, reverse=True):
+            g = np.load(candidate, mmap_mode="r")
+            if g.shape[:2] == (expected_H, expected_W):
+                sat_grid = np.array(g)
+                print(f"  [OK]     found cache: {candidate.name}  shape={sat_grid.shape}")
+                break
+            else:
+                print(f"  [SKIP]   {candidate.name}  shape={g.shape}")
+
+    if sat_grid is None:
+        print(f"  [BUILD]  No matching sat_grid — building at {expected_H}×{expected_W}...")
+        sat_grid = build_or_load_sat_grid(cache_dir, dp.TARGET_RES, dp.SAT_EMB_PATH)
+        print(f"  [DONE]   sat_grid shape={sat_grid.shape}")
     H, W, D = sat_grid.shape
 
     # L2-normalize per cell (once, for cosine similarity)
@@ -603,6 +838,14 @@ def main():
     norms = np.linalg.norm(sat_grid_flat, axis=1, keepdims=True) + 1e-8
     sat_grid_flat_norm = torch.from_numpy((sat_grid_flat / norms).astype(np.float32))
     print(f"  Normalized: {sat_grid_flat_norm.shape}, to {device}")
+
+    # --- Hungary border mask ---
+    hungary_mask = dp.build_or_load_hungary_mask(cache_dir, H)  # (H, W) bool
+    hungary_mask_flat = torch.from_numpy(hungary_mask.reshape(-1))  # (H*W,)
+    # Zero out outside-Hungary cells so they never contribute to similarity
+    sat_grid_flat_norm[~hungary_mask_flat] = 0.0
+    print(f"  Hungary mask applied: {hungary_mask_flat.sum():,} valid cells "
+          f"({hungary_mask_flat.float().mean()*100:.1f}%)")
 
     # --- Step 3: Compute centroids ---
     print("\n" + "=" * 60)
@@ -631,8 +874,8 @@ def main():
         model_id=cfg.qwen_model_id,
         freeze_encoder=True,
         lora=True,
-        lora_r=32 if multi_gpu else 16,
-        lora_alpha=64 if multi_gpu else 32,
+        lora_r=32,
+        lora_alpha=64,
         multi_gpu=multi_gpu,
     )
     text_encoder = text_encoder.to(device)
@@ -660,7 +903,8 @@ def main():
     print("=" * 60)
     train(proj_head, temperature, text_encoder, sat_centroids,
           sat_grid_flat_norm, density_maps, class_names,
-          train_texts, val_texts, cfg, device=device)
+          train_texts, val_texts, cfg, device=device,
+          hungary_mask=hungary_mask)
 
     print("\nDone.")
 

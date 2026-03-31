@@ -47,11 +47,11 @@ class PipelineConfig:
     lon_max: float = 22.897
 
     # --- Processing ---
-    target_resolution: int = 256
+    target_resolution: int = 512
     min_pixels_for_class: int = 500
 
     # --- Satellite embeddings (AlphaEarth) ---
-    sat_emb_path: str = "data_corine/embedding_inspection/embeddings_with_corine_old.parquet"
+    sat_emb_path: str = "data_corine/embedding_inspection/embeddings_with_corine.parquet"
     sat_emb_dim: int = 64
     n_sat_augments: int = 16        # sub-centroid augmentations per class
     pheno_dim: int = 2              # [sin, cos] harvest DOY appended to sat centroid
@@ -729,18 +729,30 @@ def build_satellite_embedding_grid(cfg: "PipelineConfig",
     x_idx = ((lons - cfg.lon_min) / (cfg.lon_max - cfg.lon_min) * W).clip(0, W - 1).astype(np.int32)
     flat_idx = (y_idx * W + x_idx).astype(np.int64)
 
-    print(f"  Binning {len(df):,} embeddings into {H}×{W} grid ({cfg.sat_emb_dim} dims)...")
-    cnt = np.bincount(flat_idx, minlength=H * W).astype(np.float32)  # (H*W,)
-    grid_flat = np.stack([
-        np.bincount(flat_idx, weights=embs[:, d].astype(np.float64), minlength=H * W)
-        for d in range(cfg.sat_emb_dim)
-    ], axis=1).astype(np.float32)  # (H*W, sat_emb_dim)
+    print(f"  Binning {len(df):,} embeddings into {H}×{W} grid ({cfg.sat_emb_dim} dims) [median]...")
+    # Sort once by cell index, then slice groups for per-cell median
+    sort_order = np.argsort(flat_idx, kind="stable")
+    sorted_idx = flat_idx[sort_order]
+    sorted_embs = embs[sort_order]
 
-    filled = cnt > 0
-    grid_flat[filled] /= cnt[filled, np.newaxis]
-    grid_flat[~filled] = embs.mean(axis=0)  # fill empty cells with global mean
+    unique_cells, first_occ, counts = np.unique(sorted_idx, return_index=True, return_counts=True)
+    grid_flat = np.zeros((H * W, cfg.sat_emb_dim), dtype=np.float32)
+    splits = np.split(sorted_embs, first_occ[1:])  # one array per filled cell
+    for cell, group in zip(unique_cells, splits):
+        grid_flat[cell] = np.median(group, axis=0)
 
+    filled = np.zeros(H * W, dtype=bool)
+    filled[unique_cells] = True
+
+    # Fill empty cells with nearest filled neighbor (vectorized via distance transform)
+    from scipy.ndimage import distance_transform_edt
     grid = grid_flat.reshape(H, W, cfg.sat_emb_dim)
+    filled_grid = filled.reshape(H, W)
+    print(f"  Filling {(~filled_grid).sum():,} empty cells via nearest-neighbor mean...")
+    _, nearest = distance_transform_edt(~filled_grid, return_indices=True)
+    # nearest[0] = row indices, nearest[1] = col indices of nearest filled cell
+    grid[~filled_grid] = grid[nearest[0][~filled_grid], nearest[1][~filled_grid]]
+
     np.save(cache_path, grid)
     print(f"  Grid built: {int(filled.sum()):,}/{H*W:,} cells filled → {cache_path}")
     return grid
@@ -1440,7 +1452,7 @@ def main():
         print(f"  {len(distributions)} distribution maps")
     else:
         # If no cache, import and run v1 processing
-        from pipeline import process_all_rasters
+        from full_flow import process_all_rasters
         distributions = process_all_rasters(cfg)
         with open(dist_cache, "wb") as f:
             pickle.dump(distributions, f)
