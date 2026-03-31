@@ -27,13 +27,6 @@ from typing import Optional, List
 MODEL_ID = "Qwen/Qwen3.5-4B"
 HIDDEN_DIM = 2560
 
-# Known hidden sizes for Qwen3.5 variants
-_QWEN_HIDDEN = {
-    "Qwen/Qwen3.5-4B": 2560,
-    "Qwen/Qwen3.5-9B": 4096,
-    "Qwen/Qwen3.5-27B": 4096,  # actually 5120 — will be read from config
-    "Qwen/Qwen3.5-35B": 8192,
-}
 
 
 class Qwen3EmbeddingAdapter(nn.Module):
@@ -67,6 +60,9 @@ class Qwen3EmbeddingAdapter(nn.Module):
             print(f"[Qwen3EmbeddingAdapter] Using device_map='auto' (multi-GPU)")
 
         self._model = AutoModel.from_pretrained(resolved_model_id, **load_kwargs)
+
+        self._is_fp8 = any(p.dtype == torch.float8_e4m3fn for p in self._model.parameters())
+
         cfg = self._model.config
         raw_dim = getattr(cfg, "hidden_size", None) or cfg.text_config.hidden_size
         self.hidden_dim = raw_dim
@@ -83,7 +79,11 @@ class Qwen3EmbeddingAdapter(nn.Module):
 
         if lora:
             from peft import get_peft_model, LoraConfig, TaskType
-            print(f"[Qwen3EmbeddingAdapter] Applying LoRA (r={lora_r}, alpha={lora_alpha})")
+            # FP8 models can't do dropout on quantized tensors
+            if self._is_fp8 and lora_dropout > 0:
+                print(f"[Qwen3EmbeddingAdapter] FP8 detected — forcing lora_dropout=0.0")
+                lora_dropout = 0.0
+            print(f"[Qwen3EmbeddingAdapter] Applying LoRA (r={lora_r}, alpha={lora_alpha}, dropout={lora_dropout})")
             lora_config = LoraConfig(
                 r=lora_r,
                 lora_alpha=lora_alpha,
@@ -95,12 +95,33 @@ class Qwen3EmbeddingAdapter(nn.Module):
             self._model = get_peft_model(self._model, lora_config)
             self._model.print_trainable_parameters()
             # Gradient checkpointing: trade compute for memory
-            self._model.gradient_checkpointing_enable()
-            print(f"[Qwen3EmbeddingAdapter] Gradient checkpointing enabled")
+            # Skip for FP8 — recomputation triggers ufunc_add on FP8 tensors
+            if self._is_fp8:
+                print(f"[Qwen3EmbeddingAdapter] FP8 model — skipping gradient checkpointing")
+            else:
+                self._model.gradient_checkpointing_enable()
+                print(f"[Qwen3EmbeddingAdapter] Gradient checkpointing enabled")
 
     @property
     def tokenizer(self):
         return self._tokenizer
+
+    def to(self, *args, **kwargs):
+        """Skip .to(device) when using device_map='auto' (model already placed)."""
+        if self._multi_gpu:
+            # Only move projection layer if it exists
+            if self._projection is not None:
+                self._projection = self._projection.to(*args, **kwargs)
+            return self
+        return super().to(*args, **kwargs)
+
+    @property
+    def input_device(self):
+        """Device where input tensors should be placed."""
+        if self._multi_gpu:
+            # With device_map, first layer's device is the input device
+            return next(self._model.parameters()).device
+        return next(self.parameters()).device
 
     def _last_token_pool(self, last_hidden_state, attention_mask):
         """Pool by selecting the last non-pad token per sequence."""
@@ -126,7 +147,7 @@ class Qwen3EmbeddingAdapter(nn.Module):
 
     def encode_raw(self, text: str, normalize: bool = False) -> torch.Tensor:
         """Encode a single string. Returns (1, target_dim) tensor. No gradients."""
-        device = next(self._model.parameters()).device
+        device = self.input_device
         inputs = self._tokenizer(
             text,
             return_tensors="pt",
@@ -153,7 +174,7 @@ class Qwen3EmbeddingAdapter(nn.Module):
 
         Returns: (B, target_dim) embeddings with gradients if unfrozen
         """
-        device = next(self._model.parameters()).device
+        device = self.input_device
         all_embs = []
         for i in range(0, len(texts), chunk_size):
             chunk_texts = texts[i:i + chunk_size]

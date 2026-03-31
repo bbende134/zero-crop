@@ -40,7 +40,7 @@ class Flow3Config:
     output_dir: str = "training_data_flow3"
 
     # Training
-    n_epochs: int = 30
+    n_epochs: int = 10
     lr: float = 1e-4
     batch_size: int = 32
     grad_accum_steps: int = 4       # effective batch = batch_size * grad_accum_steps
@@ -57,7 +57,8 @@ class Flow3Config:
     lon_max: float = 22.897
 
     # Qwen
-    qwen_emb_dim: int = 2560
+    qwen_model_id: str = "Qwen/Qwen3.5-4B"
+    qwen_emb_dim: int = 0  # 0 = auto-detect from model
 
 
 # ============================================================
@@ -319,7 +320,7 @@ def visualize_predictions(model, text_encoder, density_maps, class_names,
         for row, query in enumerate(queries):
             # Encode
             emb = text_encoder.encode_raw(query)
-            logits = model(emb)
+            logits = model(emb.to(next(model.parameters()).device))
             probs = torch.sigmoid(logits)  # (1, C)
             merged = merge_maps(probs.to(density_maps.device),
                                 density_maps)  # (1, H, W)
@@ -379,7 +380,7 @@ def train(model, text_encoder, density_maps, class_names,
         optimizer, T_max=total_steps, eta_min=1e-6)
 
     tokenizer = text_encoder._tokenizer
-    qwen_device = next(text_encoder.parameters()).device
+    qwen_device = text_encoder.input_device
 
     viz_dir = Path(cfg.output_dir) / "viz"
     viz_dir.mkdir(parents=True, exist_ok=True)
@@ -406,11 +407,25 @@ def train(model, text_encoder, density_maps, class_names,
         print(f"[resume] Loading {ckpt_path}")
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["classifier"])
+        # Restore LoRA weights
+        lora_state = ckpt.get("qwen_lora", {})
+        if lora_state:
+            text_encoder.load_state_dict(lora_state, strict=False)
+            print(f"  Restored {len(lora_state)} LoRA weight tensors")
+        else:
+            print("  WARNING: no LoRA weights in checkpoint (pre-fix checkpoint)")
         start_epoch = ckpt.get("epoch", 0) + 1
         train_losses = ckpt.get("train_losses", [])
         train_accs = ckpt.get("train_accs", [])
         val_losses = ckpt.get("val_losses", [])
         val_accs = ckpt.get("val_accs", [])
+        # Restore optimizer state
+        if "optimizer" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer"])
+            print(f"  Restored optimizer state")
+        if "scheduler" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler"])
+            print(f"  Restored scheduler state")
         print(f"  Resuming from epoch {start_epoch}")
 
     print(f"\nTraining: {n_classes} classes, {len(train_pool)} train sentences")
@@ -431,7 +446,7 @@ def train(model, text_encoder, density_maps, class_names,
         for batch_i in pbar:
             texts, labels = sample_batch(train_pool, texts_by_class,
                                          n_classes, cfg)
-            labels = labels.to(qwen_device)
+            labels = labels.to(device)
 
             inputs = tokenizer(
                 texts, return_tensors="pt",
@@ -442,7 +457,7 @@ def train(model, text_encoder, density_maps, class_names,
 
             with torch.autocast(qwen_device.type, dtype=torch.bfloat16):
                 embs = text_encoder(input_ids, attn_mask)
-                logits = model(embs)
+                logits = model(embs.to(device))
                 loss = loss_fn(logits, labels) / cfg.grad_accum_steps
 
             loss.backward()
@@ -482,7 +497,7 @@ def train(model, text_encoder, density_maps, class_names,
             for i in range(0, len(val_pool), cfg.batch_size):
                 batch = val_pool[i:i + cfg.batch_size]
                 texts_v = [s for s, _ in batch]
-                labels_v = torch.zeros(len(batch), n_classes, device=qwen_device)
+                labels_v = torch.zeros(len(batch), n_classes, device=device)
                 for j, (_, cls_idx) in enumerate(batch):
                     labels_v[j, cls_idx] = 1.0
 
@@ -495,7 +510,7 @@ def train(model, text_encoder, density_maps, class_names,
 
                 with torch.autocast(qwen_device.type, dtype=torch.bfloat16):
                     embs_v = text_encoder(input_ids_v, attn_mask_v)
-                    logits_v = model(embs_v)
+                    logits_v = model(embs_v.to(device))
                     v_loss_sum += loss_fn(logits_v, labels_v).item()
                     v_batches += 1
 
@@ -547,9 +562,14 @@ def train(model, text_encoder, density_maps, class_names,
 
         # --- Checkpoint (every epoch) ---
         Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
+        lora_state = {k: v.cpu() for k, v in text_encoder.state_dict().items()
+                      if "lora" in k.lower()}
         torch.save({
             "epoch": epoch,
             "classifier": model.state_dict(),
+            "qwen_lora": lora_state,
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
             "train_losses": train_losses,
             "train_accs": train_accs,
             "val_losses": val_losses,
@@ -560,8 +580,11 @@ def train(model, text_encoder, density_maps, class_names,
 
     # Final save
     Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
+    lora_state = {k: v.cpu() for k, v in text_encoder.state_dict().items()
+                  if "lora" in k.lower()}
     torch.save({
         "classifier": model.state_dict(),
+        "qwen_lora": lora_state,
         "class_names": class_names,
         "density_maps": density_maps.cpu(),
         "config": vars(cfg),
@@ -577,14 +600,21 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", default=None)
     parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--model", default=None,
+                        help="Qwen model ID, e.g. Qwen/Qwen3.5-27B")
+    parser.add_argument("--multi-gpu", action="store_true",
+                        help="Split model across all GPUs via device_map='auto'")
     args = parser.parse_args()
 
     cfg = Flow3Config()
     if args.output_dir:
         cfg.output_dir = args.output_dir
+    if args.model:
+        cfg.qwen_model_id = args.model
 
+    multi_gpu = args.multi_gpu
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+    print(f"Device: {device}, multi_gpu: {multi_gpu}")
 
     # --- Step 1: Load cached pairs ---
     print("\n" + "=" * 60)
@@ -615,13 +645,18 @@ def main():
     print("=" * 60)
     from fine_tune.qwen3_adapter import Qwen3EmbeddingAdapter
     text_encoder = Qwen3EmbeddingAdapter(
-        target_dim=cfg.qwen_emb_dim,
+        model_id=cfg.qwen_model_id,
         freeze_encoder=True,    # freeze base, LoRA adapters are trainable
         lora=True,
+        lora_r=32 if multi_gpu else 16,
+        lora_alpha=64 if multi_gpu else 32,
+        multi_gpu=multi_gpu,
     )
     text_encoder = text_encoder.to(device)
+    # Auto-detect embedding dim from loaded model
+    cfg.qwen_emb_dim = text_encoder.target_dim
     n_lora = sum(p.numel() for p in text_encoder.parameters() if p.requires_grad)
-    print(f"  Qwen3 loaded on {device}")
+    print(f"  Qwen3 loaded, emb_dim={cfg.qwen_emb_dim}")
     print(f"  LoRA trainable params: {n_lora:,}")
 
     # --- Step 5: Train classifier ---
