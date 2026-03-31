@@ -48,7 +48,7 @@ class Flow3Config:
     # Training
     n_epochs: int = 30
     lr: float = 1e-4
-    batch_size: int = 64
+    batch_size: int = 32
     val_fraction: float = 0.15
     multi_label_ratio: float = 0.50
     negative_ratio: float = 0.05
@@ -62,20 +62,22 @@ class Flow3Config:
     lon_max: float = 22.897
 
     # Qwen
-    qwen_model_id: str = "Qwen/Qwen3.5-9B"
+    qwen_model_id: str = "Qwen/Qwen3.5-35B-A3B"
     qwen_emb_dim: int = 4096
+    use_4bit: bool = True
     lora_r: int = 32
     lora_alpha: int = 64
 
     @property
     def pairs_cache(self) -> str:
-        # Match flow_2.py's hash: _cfg_hash(dist_hash, text, hrl, qwen_emb_dim)
-        # Derive dist_hash from the distributions cache file present on disk.
+        # flow_3 only uses class_name, desc_key, density_map from pairs — NOT
+        # pre-computed embeddings.  So the hash must NOT include qwen_model_id
+        # or qwen_emb_dim; those only affect flow_2's embedding step.
         dist_files = sorted(Path(self.pairs_cache_dir).glob("distributions_*.pkl"))
         if not dist_files:
             raise FileNotFoundError(f"No distributions cache in {self.pairs_cache_dir} — run flow_2.py first")
         dist_hash = dist_files[0].stem.split("_", 1)[1]
-        h = _cfg_hash(dist_hash, self.text_descriptions_path, self.hrl_descriptions_path, self.qwen_emb_dim)
+        h = _cfg_hash(dist_hash, self.text_descriptions_path, self.hrl_descriptions_path)
         return f"{self.pairs_cache_dir}/pairs_{h}.pt"
 
 
@@ -327,6 +329,7 @@ def visualize_predictions(model, text_encoder, density_maps, class_names,
                           queries, cfg, epoch, viz_dir):
     """Render predictions for a set of test queries."""
     model.eval()
+    classifier_device = next(model.parameters()).device
     n = len(queries)
     fig, axes = plt.subplots(n, 2, figsize=(12, 3 * n))
     if n == 1:
@@ -336,8 +339,8 @@ def visualize_predictions(model, text_encoder, density_maps, class_names,
 
     with torch.no_grad():
         for row, query in enumerate(queries):
-            # Encode
-            emb = text_encoder.encode_raw(query)
+            # Encode — bridge to classifier device
+            emb = text_encoder.encode_raw(query).to(classifier_device)
             logits = model(emb)
             probs = torch.sigmoid(logits)  # (1, C)
             merged = merge_maps(probs.to(density_maps.device),
@@ -369,6 +372,25 @@ def visualize_predictions(model, text_encoder, density_maps, class_names,
     model.train()
 
 
+def _save_progress_plot(train_losses, train_accs, val_losses, val_accs, viz_dir):
+    fig, (ax_loss, ax_acc) = plt.subplots(1, 2, figsize=(12, 4))
+    ax_loss.plot(train_losses, label="train loss", color="coral")
+    ax_loss.plot(val_losses, label="val loss", color="steelblue", linestyle="--")
+    ax_loss.set_xlabel("Epoch")
+    ax_loss.set_ylabel("BCE Loss")
+    ax_loss.legend()
+    ax_loss.set_title("Loss")
+    ax_acc.plot(train_accs, label="train acc", color="mediumseagreen")
+    ax_acc.plot(val_accs, label="val acc", color="steelblue", linestyle="--")
+    ax_acc.set_xlabel("Epoch")
+    ax_acc.set_ylabel("Accuracy %")
+    ax_acc.legend()
+    ax_acc.set_title("Accuracy")
+    plt.tight_layout()
+    plt.savefig(viz_dir / "progress.png", dpi=120)
+    plt.close(fig)
+
+
 # ============================================================
 # TRAINING
 # ============================================================
@@ -379,6 +401,10 @@ def train(model, text_encoder, density_maps, class_names,
 
     n_classes = len(class_names)
     density_maps_dev = density_maps.to(device)
+
+    tokenizer = text_encoder._tokenizer
+    qwen_device = text_encoder._get_model_device()
+    classifier_device = next(model.parameters()).device
 
     # Optimizer: LoRA params + classifier head
     qwen_params = [p for p in text_encoder.parameters() if p.requires_grad]
@@ -397,9 +423,6 @@ def train(model, text_encoder, density_maps, class_names,
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=total_steps, eta_min=1e-6)
 
-    tokenizer = text_encoder._tokenizer
-    qwen_device = next(text_encoder.parameters()).device
-
     viz_dir = Path(cfg.output_dir) / "viz"
     viz_dir.mkdir(parents=True, exist_ok=True)
 
@@ -416,17 +439,27 @@ def train(model, text_encoder, density_maps, class_names,
     ]
 
     loss_fn = nn.BCEWithLogitsLoss()
-    train_losses, val_accs = [], []
+    train_losses, train_accs, val_losses, val_accs = [], [], [], []
 
-    # Resume
+    # Resume — restore classifier, LoRA weights, optimizer and scheduler
     ckpt_path = Path(cfg.output_dir) / "checkpoint.pt"
     start_epoch = 0
     if ckpt_path.exists():
         print(f"[resume] Loading {ckpt_path}")
-        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         model.load_state_dict(ckpt["classifier"])
+        if "lora_state" in ckpt:
+            from peft import set_peft_model_state_dict
+            set_peft_model_state_dict(text_encoder._model, ckpt["lora_state"])
+            print("  LoRA weights restored")
+        if "optimizer" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        if "scheduler" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler"])
         start_epoch = ckpt.get("epoch", 0) + 1
         train_losses = ckpt.get("train_losses", [])
+        train_accs = ckpt.get("train_accs", [])
+        val_losses = ckpt.get("val_losses", [])
         val_accs = ckpt.get("val_accs", [])
         print(f"  Resuming from epoch {start_epoch}")
 
@@ -448,7 +481,7 @@ def train(model, text_encoder, density_maps, class_names,
         for batch_i in pbar:
             texts, labels = sample_batch(train_pool, texts_by_class,
                                          n_classes, cfg)
-            labels = labels.to(qwen_device)
+            labels = labels.to(classifier_device)
 
             inputs = tokenizer(
                 texts, return_tensors="pt",
@@ -459,7 +492,7 @@ def train(model, text_encoder, density_maps, class_names,
 
             with torch.autocast(qwen_device.type, dtype=torch.bfloat16):
                 embs = text_encoder(input_ids, attn_mask)
-                logits = model(embs)
+                logits = model(embs.to(classifier_device))
                 loss = loss_fn(logits, labels)
 
             optimizer.zero_grad()
@@ -486,16 +519,17 @@ def train(model, text_encoder, density_maps, class_names,
         avg_loss = ep_loss / n_batches
         train_acc = n_correct / max(1, n_total) * 100
         train_losses.append(avg_loss)
+        train_accs.append(train_acc)
 
         # --- Validation ---
         model.eval()
         text_encoder.eval()
-        v_correct, v_total = 0, 0
+        v_loss, v_correct, v_total = 0.0, 0, 0
         with torch.no_grad():
             for i in range(0, len(val_pool), cfg.batch_size):
                 batch = val_pool[i:i + cfg.batch_size]
                 texts_v = [s for s, _ in batch]
-                labels_v = torch.zeros(len(batch), n_classes, device=qwen_device)
+                labels_v = torch.zeros(len(batch), n_classes, device=classifier_device)
                 for j, (_, cls_idx) in enumerate(batch):
                     labels_v[j, cls_idx] = 1.0
 
@@ -508,62 +542,63 @@ def train(model, text_encoder, density_maps, class_names,
 
                 with torch.autocast(qwen_device.type, dtype=torch.bfloat16):
                     embs_v = text_encoder(input_ids_v, attn_mask_v)
-                    logits_v = model(embs_v)
+                    logits_v = model(embs_v.to(classifier_device))
 
+                v_loss += loss_fn(logits_v, labels_v).item()
                 preds_v = logits_v.argmax(dim=-1)
                 targets_v = labels_v.argmax(dim=-1)
                 v_correct += (preds_v == targets_v).sum().item()
                 v_total += len(batch)
 
+        n_val_batches = max(1, -(-len(val_pool) // cfg.batch_size))  # ceil div
+        val_loss = v_loss / n_val_batches
         val_acc = v_correct / max(1, v_total) * 100
+        val_losses.append(val_loss)
         val_accs.append(val_acc)
         model.train()
         text_encoder.train()
 
-        if (epoch + 1) % 5 == 0 or epoch == 0:
-            print(f"Epoch {epoch+1:3d}: loss={avg_loss:.4f}, "
-                  f"train_acc={train_acc:.1f}%, val_acc={val_acc:.1f}%")
+        print(f"Epoch {epoch+1:3d}: train_loss={avg_loss:.4f} train_acc={train_acc:.1f}%  "
+              f"val_loss={val_loss:.4f} val_acc={val_acc:.1f}%")
 
-        # --- Visualization + checkpoint ---
+        # --- Checkpoint + plot (every epoch) ---
+        from peft import get_peft_model_state_dict
+        Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
+        torch.save({
+            "epoch": epoch,
+            "classifier": model.state_dict(),
+            "lora_state": get_peft_model_state_dict(text_encoder._model),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "train_losses": train_losses,
+            "train_accs": train_accs,
+            "val_losses": val_losses,
+            "val_accs": val_accs,
+            "class_names": class_names,
+            "config": vars(cfg),
+        }, ckpt_path)
+        _save_progress_plot(train_losses, train_accs, val_losses, val_accs, viz_dir)
+
         if cfg.plot_every > 0 and ((epoch + 1) % cfg.plot_every == 0 or epoch == 0):
             visualize_predictions(
                 model, text_encoder, density_maps_dev, class_names,
                 test_queries, cfg, epoch + 1, viz_dir)
 
-            # Loss + accuracy plot
-            fig, ax1 = plt.subplots(figsize=(8, 4))
-            ax1.plot(train_losses, label="train loss", color="coral")
-            ax1.set_xlabel("Epoch")
-            ax1.set_ylabel("BCE Loss")
-            ax1.legend(loc="upper left")
-            ax2 = ax1.twinx()
-            ax2.plot(val_accs, label="val acc", color="steelblue", linestyle="--")
-            ax2.set_ylabel("Accuracy %")
-            ax2.legend(loc="upper right")
-            plt.title("Training Progress")
-            plt.tight_layout()
-            plt.savefig(viz_dir / "progress.png", dpi=120)
-            plt.close(fig)
-
-            # Checkpoint
-            Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
-            torch.save({
-                "epoch": epoch,
-                "classifier": model.state_dict(),
-                "train_losses": train_losses,
-                "val_accs": val_accs,
-                "class_names": class_names,
-                "config": vars(cfg),
-            }, ckpt_path)
-
-    # Final save
+    # Final save — everything needed to run inference
+    from peft import get_peft_model_state_dict
     Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
     torch.save({
         "classifier": model.state_dict(),
+        "lora_state": get_peft_model_state_dict(text_encoder._model),
         "class_names": class_names,
         "density_maps": density_maps.cpu(),
+        "train_losses": train_losses,
+        "train_accs": train_accs,
+        "val_losses": val_losses,
+        "val_accs": val_accs,
         "config": vars(cfg),
     }, Path(cfg.output_dir) / "flow3_model.pt")
+    _save_progress_plot(train_losses, train_accs, val_losses, val_accs, viz_dir)
     print(f"\n  Saved to {Path(cfg.output_dir) / 'flow3_model.pt'}")
 
 
@@ -618,7 +653,8 @@ def main():
     text_encoder = Qwen3EmbeddingAdapter(
         target_dim=cfg.qwen_emb_dim,
         pretrained_encoder_path=cfg.qwen_model_id,
-        freeze_encoder=True,    # freeze base, LoRA adapters are trainable
+        freeze_encoder=True,    # freeze base, LoRA/QLoRA adapters are trainable
+        use_4bit=cfg.use_4bit,
         lora=True,
         lora_r=cfg.lora_r,
         lora_alpha=cfg.lora_alpha,

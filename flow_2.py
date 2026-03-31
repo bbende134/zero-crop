@@ -72,7 +72,9 @@ class PipelineConfig:
     bridge_lr: float = 1e-4
 
     # --- Qwen (frozen, used only for bridge training) ---
-    qwen_emb_dim: int = 4096        # Qwen3.5-9B hidden dim — bridge input
+    qwen_model_id: str = "Qwen/Qwen3.5-35B-A3B"
+    qwen_emb_dim: int = 4096        # adapter output dim (projection added if model hidden ≠ this)
+    use_4bit: bool = True           # QLoRA: NF4 via bitsandbytes, dequantized to bfloat16 for compute
 
     # --- Training ---
     n_epochs: int = 400
@@ -1454,7 +1456,7 @@ def main():
     # happens in Step 3 on top of these cached Qwen embeddings.
     pairs_hash = _cfg_hash(
         dist_hash, cfg.text_descriptions_path, cfg.hrl_descriptions_path,
-        cfg.qwen_emb_dim,
+        cfg.qwen_emb_dim, cfg.qwen_model_id,
     )
     pairs_cache = cache_dir / f"pairs_{pairs_hash}.pt"
 
@@ -1465,7 +1467,12 @@ def main():
     else:
         from full_flow import build_training_pairs
         from fine_tune.qwen3_adapter import Qwen3EmbeddingAdapter
-        enc = Qwen3EmbeddingAdapter(target_dim=cfg.qwen_emb_dim, freeze_encoder=True)
+        enc = Qwen3EmbeddingAdapter(
+            target_dim=cfg.qwen_emb_dim,
+            pretrained_encoder_path=cfg.qwen_model_id,
+            freeze_encoder=True,
+            use_4bit=cfg.use_4bit,
+        )
         enc = enc.to(device).eval()
         pairs = build_training_pairs(
             distributions, cfg.text_descriptions_path, enc,
