@@ -184,6 +184,7 @@ def load_model(checkpoint_path: str, device: str = "cuda"):
     class_names = ckpt.get("class_names", [])
     qwen_lora = ckpt.get("qwen_lora", None)
     bridge_state = ckpt.get("bridge", None)
+    class_embeddings = ckpt.get("class_embeddings", {})
 
     bridge = None
     if bridge_state is not None:
@@ -191,14 +192,14 @@ def load_model(checkpoint_path: str, device: str = "cuda"):
         bridge_cfg = cfg if isinstance(cfg, dict) else vars(cfg)
         b = TextToSatBridge(
             text_dim=bridge_cfg.get("qwen_emb_dim", 2560),
-            sat_dim=bridge_cfg.get("sat_emb_dim", 64),
+            sat_dim=bridge_cfg.get("text_emb_dim", 66),   # sat(64)+pheno(2)=66
             hidden_dim=bridge_cfg.get("bridge_hidden_dim", 256),
         )
         b.load_state_dict(bridge_state)
         bridge = b.to(device).eval()
         print(f"  Loaded TextToSatBridge weights")
 
-    return model, cfg, class_names, qwen_lora, bridge
+    return model, cfg, class_names, qwen_lora, bridge, class_embeddings
 
 
 def load_text_encoder(device: str = "cuda", qwen_lora=None):
@@ -266,6 +267,9 @@ def plot_density_map(density, cfg, title="", save_path=None, show_colorbar=True)
 def plot_multi_grid(densities, titles, cfg, save_path=None, ncols=4):
     """Plot multiple density maps in a grid."""
     n = len(densities)
+    if n == 0:
+        print("  [skip] No maps to plot in grid")
+        return
     ncols = min(ncols, n)
     nrows = (n + ncols - 1) // ncols
     fig, axes = plt.subplots(nrows, ncols, figsize=(4.5 * ncols, 3.5 * nrows))
@@ -333,6 +337,10 @@ def main():
         help="Device to run on (default: cuda)",
     )
     parser.add_argument(
+        "--gpu", type=int, default=None,
+        help="GPU index shorthand — sets device to cuda:N (overrides --device)",
+    )
+    parser.add_argument(
         "--no-lora", action="store_true",
         help="Skip loading LoRA weights even if present in checkpoint",
     )
@@ -344,19 +352,19 @@ def main():
         print("\n❌ Provide --query or --all-classes")
         sys.exit(1)
 
-    device = args.device
+    device = f"cuda:{args.gpu}" if args.gpu is not None else args.device
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # --- Load model + bridge ---
-    model, cfg, class_names, qwen_lora, bridge = load_model(args.checkpoint, device)
+    model, cfg, class_names, qwen_lora, bridge, class_embeddings = load_model(args.checkpoint, device)
     if args.height:
         cfg["target_resolution"] = args.height
     if args.no_lora:
         qwen_lora = None
 
-    # Determine whether this is a satellite-conditioned checkpoint
-    is_sat_model = cfg.get("text_emb_dim", 2560) <= 64
+    # Determine whether this is a satellite-conditioned checkpoint (sat+pheno ≤ 128)
+    is_sat_model = cfg.get("text_emb_dim", 2560) <= 128
 
     # --- Load Qwen encoder once if any query mode needs it ---
     enc_device = "cuda:1" if torch.cuda.device_count() > 1 else device
@@ -396,17 +404,22 @@ def main():
 
     # --- Render all training classes ---
     if args.all_classes:
+        # Fallback: load class names + embeddings from pairs cache if checkpoint
+        # predates the class_names/class_embeddings fields.
+        if not class_names:
+            pairs_cache = sorted(Path("pipeline_cache").glob("pairs_*.pt"))
+            if pairs_cache:
+                print(f"  [fallback] Loading class names from {pairs_cache[-1]}")
+                cached = torch.load(pairs_cache[-1], map_location="cpu", weights_only=False)
+                class_names = [p["class_name"] for p in cached]
+
         print(f"\nRendering all {len(class_names)} training classes...")
 
-        # Load precomputed satellite embeddings from cache
-        pairs_cache = list(Path("pipeline_cache").glob("pairs_*.pt"))
-        precomputed = {}
-        if pairs_cache:
-            print(f"  Loading pairs cache: {pairs_cache[0]}")
-            cached_pairs = torch.load(pairs_cache[0], map_location="cpu",
-                                      weights_only=False)
-            for p in cached_pairs:
-                precomputed[p["class_name"]] = p["avg_embedding"]
+        # Use class embeddings saved in checkpoint (sat+pheno centroids),
+        # falling back to bridge(Qwen) for older checkpoints that lack them.
+        precomputed = class_embeddings
+        if precomputed:
+            print(f"  Using {len(precomputed)} class embeddings from checkpoint")
 
         densities, titles = [], []
         for name in class_names:

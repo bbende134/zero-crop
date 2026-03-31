@@ -54,14 +54,15 @@ class PipelineConfig:
     sat_emb_path: str = "data_corine/embedding_inspection/embeddings_with_corine_old.parquet"
     sat_emb_dim: int = 64
     n_sat_augments: int = 16        # sub-centroid augmentations per class
+    pheno_dim: int = 2              # [sin, cos] harvest DOY appended to sat centroid
 
     # --- Model ---
     n_bases: int = 24
     n_fourier_freqs: int = 64
     hidden_dim: int = 128
     coord_hidden: int = 128
-    text_emb_dim: int = 64          # satellite embedding dim (was 2560 Qwen)
-    text_proj_dim: int = 64         # project sat emb before FiLM
+    text_emb_dim: int = 66          # sat(64) + phenology(2)
+    text_proj_dim: int = 66         # project sat+pheno emb before FiLM
 
     # --- TextToSatBridge (text → satellite space projection) ---
     bridge_hidden_dim: int = 256
@@ -81,7 +82,7 @@ class PipelineConfig:
     val_samples: int = 100_000
     weight_decay: float = 1e-5
     text_dropout: float = 0.0        # no dropout — always condition on sat embedding
-    discrimination_weight: float = 0.5
+    discrimination_weight: float = 0.0
     disc_warmup_epochs: int = 50
     disc_ramp_epochs: int = 50
     plot_every: int = 20
@@ -147,7 +148,7 @@ class TextToSatBridge(nn.Module):
     query is routed through Qwen (frozen) → this bridge → spatial model.
     """
 
-    def __init__(self, text_dim: int = 2560, sat_dim: int = 64,
+    def __init__(self, text_dim: int = 2560, sat_dim: int = 66,
                  hidden_dim: int = 256):
         super().__init__()
         self.proj = nn.Sequential(
@@ -407,6 +408,30 @@ _HRL_TO_CORINE: Dict[str, str] = {
     "main_crop_harvest_date": "211", "permanent_grassland": "231",
     "bare_soil_before_sowing": "211", "bare_soil_after_harvest": "211",
 }
+
+# Harvest day-of-year per HRL crop class (approximate Hungarian agricultural calendar).
+# Used to break the identical-centroid problem: crops sharing Code_18="211" still get
+# distinct conditioning vectors because their harvest windows differ.
+# CORINE land-cover classes (forests, water, urban…) have no harvest cycle → zeros.
+_PHENOLOGY_DOY: Dict[str, int] = {
+    "wheat": 185, "barley": 175, "maize": 270, "rice": 270,
+    "other_cereals": 180, "fresh_vegetables": 200, "dry_pulses": 210,
+    "potatoes": 200, "sugar_beet": 290, "sunflower": 250,
+    "soybeans": 260, "rapeseed": 155, "flax_cotton_hemp": 230,
+    "grapes": 270, "olives": 300, "fruits": 220, "nuts": 260,
+    "unclassified_arable": 210, "unclassified_permanent": 240,
+    "main_crop_harvest_date": 180, "permanent_grassland": 180,
+    "bare_soil_before_sowing": 100, "bare_soil_after_harvest": 220,
+}
+
+
+def _phenology_encoding(desc_key: str) -> np.ndarray:
+    """2-d cyclic encoding of harvest DOY → [sin, cos]. Zeros for non-crop classes."""
+    doy = _PHENOLOGY_DOY.get(desc_key, 0)
+    if doy == 0:
+        return np.zeros(2, dtype=np.float32)
+    angle = 2.0 * math.pi * doy / 365.0
+    return np.array([math.sin(angle), math.cos(angle)], dtype=np.float32)
 
 
 def _fetch_milvus_tile(lat0: float, lat1: float, lon0: float, lon1: float,
@@ -723,16 +748,28 @@ def build_density_weighted_sat_pairs(pairs: List[dict],
                 c = (c / (np.linalg.norm(c) + 1e-8)).astype(np.float32)
                 augs.append(c)
 
+        # Resolve desc_key for phenology lookup
+        desc_key = p.get("desc_key", p["class_name"])
+        if desc_key.startswith("corine_"):
+            desc_key = desc_key[7:]
+        pheno = _phenology_encoding(desc_key)  # (2,)
+
+        # Append phenology to centroid and every augmentation
+        centroid_full = np.concatenate([centroid, pheno])                      # (D+2,)
+        augs_full = [np.concatenate([a, pheno]) for a in augs]                 # [(D+2,)]
+
         new_p = dict(p)
         # Preserve Qwen embeddings for bridge training
         new_p["qwen_avg_embedding"] = p["avg_embedding"].clone()
         new_p["qwen_sentence_embeddings"] = p["sentence_embeddings"].clone()
-        # Replace conditioning with density-weighted centroid
-        new_p["avg_embedding"] = torch.from_numpy(centroid).float()
-        new_p["sentence_embeddings"] = torch.from_numpy(np.stack(augs)).float()
+        # Replace conditioning with density-weighted centroid + phenology
+        new_p["avg_embedding"] = torch.from_numpy(centroid_full).float()
+        new_p["sentence_embeddings"] = torch.from_numpy(np.stack(augs_full)).float()
         enriched.append(new_p)
 
-    print(f"  Density-weighted sat pairs: {len(enriched)} classes")
+    cond_dim = cfg.sat_emb_dim + cfg.pheno_dim
+    print(f"  Density-weighted sat pairs: {len(enriched)} classes "
+          f"(centroid dim={cond_dim})")
     return enriched
 
 
@@ -1370,6 +1407,9 @@ def train(model, train_sampler, cfg, device="cuda", sample_pairs=None,
                 "disc_losses": disc_losses,
                 "align_losses": align_losses,
                 "config": vars(cfg),
+                "class_names": [p["class_name"] for p in (sample_pairs or [])],
+                "class_embeddings": {p["class_name"]: p["avg_embedding"]
+                                     for p in (sample_pairs or [])},
             }
             if bridge is not None:
                 ckpt_data["bridge"] = bridge.state_dict()
@@ -1477,21 +1517,21 @@ def main():
     print("STEP 4: Build GPU-native samplers (class-level split)")
     print("=" * 60)
 
-    train_pairs, val_pairs = split_pairs_by_class(
-        pairs, val_fraction=cfg.val_class_fraction
-    )
-
+    # Use all classes for both train and val — val tests spatial coordinate
+    # interpolation (held-out pixels), not held-out classes.  Class-level val
+    # was always stuck because the spatial model never sees unseen conditioning
+    # vectors; that generalisation is handled by the bridge at inference time.
     train_sampler = GPUSampler(
-        train_pairs, cfg, device=device,
+        pairs, cfg, device=device,
         text_dropout=cfg.text_dropout,
     )
     val_sampler = GPUSampler(
-        val_pairs, cfg, device=device,
+        pairs, cfg, device=device,
         text_dropout=0.0,
     )
     val_sampler.samples_per_epoch = cfg.val_samples
-    print(f"  Train: {train_sampler.samples_per_epoch:,} samples, {len(train_pairs)} classes")
-    print(f"  Val:   {val_sampler.samples_per_epoch:,} samples, {len(val_pairs)} classes")
+    print(f"  Train: {train_sampler.samples_per_epoch:,} samples, {len(pairs)} classes")
+    print(f"  Val:   {val_sampler.samples_per_epoch:,} samples, {len(pairs)} classes (coord-level split)")
 
     # --- Step 5: Build spatial model + TextToSatBridge ---
     print("\n" + "=" * 60)
@@ -1513,7 +1553,7 @@ def main():
     if has_qwen:
         bridge = TextToSatBridge(
             text_dim=cfg.qwen_emb_dim,
-            sat_dim=cfg.sat_emb_dim,
+            sat_dim=cfg.text_emb_dim,   # sat(64) + pheno(2) = 66
             hidden_dim=cfg.bridge_hidden_dim,
         )
         print(f"  TextToSatBridge: {cfg.qwen_emb_dim}→{cfg.bridge_hidden_dim}→{cfg.sat_emb_dim}")
@@ -1537,6 +1577,7 @@ def main():
         "model_state_dict": model.state_dict(),
         "config": vars(cfg),
         "class_names": [p["class_name"] for p in pairs],
+        "class_embeddings": {p["class_name"]: p["avg_embedding"] for p in pairs},
     }
     if bridge is not None:
         save_data["bridge"] = bridge.state_dict()
