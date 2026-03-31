@@ -43,6 +43,7 @@ class Flow3Config:
     n_epochs: int = 30
     lr: float = 1e-4
     batch_size: int = 32
+    grad_accum_steps: int = 4       # effective batch = batch_size * grad_accum_steps
     val_fraction: float = 0.15
     multi_label_ratio: float = 0.50
     negative_ratio: float = 0.05
@@ -396,7 +397,7 @@ def train(model, text_encoder, density_maps, class_names,
     ]
 
     loss_fn = nn.BCEWithLogitsLoss()
-    train_losses, val_accs = [], []
+    train_losses, train_accs, val_losses, val_accs = [], [], [], []
 
     # Resume
     ckpt_path = Path(cfg.output_dir) / "checkpoint.pt"
@@ -407,6 +408,8 @@ def train(model, text_encoder, density_maps, class_names,
         model.load_state_dict(ckpt["classifier"])
         start_epoch = ckpt.get("epoch", 0) + 1
         train_losses = ckpt.get("train_losses", [])
+        train_accs = ckpt.get("train_accs", [])
+        val_losses = ckpt.get("val_losses", [])
         val_accs = ckpt.get("val_accs", [])
         print(f"  Resuming from epoch {start_epoch}")
 
@@ -440,15 +443,17 @@ def train(model, text_encoder, density_maps, class_names,
             with torch.autocast(qwen_device.type, dtype=torch.bfloat16):
                 embs = text_encoder(input_ids, attn_mask)
                 logits = model(embs)
-                loss = loss_fn(logits, labels)
+                loss = loss_fn(logits, labels) / cfg.grad_accum_steps
 
-            optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(qwen_params, 1.0)
-            optimizer.step()
-            scheduler.step()
 
-            ep_loss += loss.item()
+            if (batch_i + 1) % cfg.grad_accum_steps == 0 or batch_i == n_batches - 1:
+                torch.nn.utils.clip_grad_norm_(qwen_params, 1.0)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+
+            ep_loss += loss.item() * cfg.grad_accum_steps
             # Accuracy on single-class samples only
             with torch.no_grad():
                 preds = (torch.sigmoid(logits) > 0.5).float()
@@ -466,11 +471,13 @@ def train(model, text_encoder, density_maps, class_names,
         avg_loss = ep_loss / n_batches
         train_acc = n_correct / max(1, n_total) * 100
         train_losses.append(avg_loss)
+        train_accs.append(train_acc)
 
         # --- Validation ---
         model.eval()
         text_encoder.eval()
         v_correct, v_total = 0, 0
+        v_loss_sum, v_batches = 0.0, 0
         with torch.no_grad():
             for i in range(0, len(val_pool), cfg.batch_size):
                 batch = val_pool[i:i + cfg.batch_size]
@@ -489,52 +496,67 @@ def train(model, text_encoder, density_maps, class_names,
                 with torch.autocast(qwen_device.type, dtype=torch.bfloat16):
                     embs_v = text_encoder(input_ids_v, attn_mask_v)
                     logits_v = model(embs_v)
+                    v_loss_sum += loss_fn(logits_v, labels_v).item()
+                    v_batches += 1
 
                 preds_v = logits_v.argmax(dim=-1)
                 targets_v = labels_v.argmax(dim=-1)
                 v_correct += (preds_v == targets_v).sum().item()
                 v_total += len(batch)
 
+        val_loss = v_loss_sum / max(1, v_batches)
         val_acc = v_correct / max(1, v_total) * 100
+        val_losses.append(val_loss)
         val_accs.append(val_acc)
         model.train()
         text_encoder.train()
 
-        if (epoch + 1) % 5 == 0 or epoch == 0:
-            print(f"Epoch {epoch+1:3d}: loss={avg_loss:.4f}, "
-                  f"train_acc={train_acc:.1f}%, val_acc={val_acc:.1f}%")
+        print(f"Epoch {epoch+1:3d}: train_loss={avg_loss:.4f}, val_loss={val_loss:.4f}, "
+              f"train_acc={train_acc:.1f}%, val_acc={val_acc:.1f}%")
 
-        # --- Visualization + checkpoint ---
+        # --- Loss + accuracy plot (every epoch) ---
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+        epochs_x = list(range(1, len(train_losses) + 1))
+
+        ax1.plot(epochs_x, train_losses, label="train", color="coral", marker="o", markersize=3)
+        ax1.plot(epochs_x, val_losses, label="val", color="steelblue", marker="o", markersize=3)
+        ax1.set_xlabel("Epoch")
+        ax1.set_ylabel("BCE Loss")
+        ax1.set_title("Loss")
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+
+        ax2.plot(epochs_x, train_accs, label="train", color="coral", marker="o", markersize=3)
+        ax2.plot(epochs_x, val_accs, label="val", color="steelblue", marker="o", markersize=3)
+        ax2.set_xlabel("Epoch")
+        ax2.set_ylabel("Accuracy %")
+        ax2.set_title("Accuracy")
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+
+        plt.suptitle("Training Progress")
+        plt.tight_layout()
+        plt.savefig(viz_dir / "progress.png", dpi=120)
+        plt.close(fig)
+
+        # --- Visualization (every plot_every epochs) ---
         if cfg.plot_every > 0 and ((epoch + 1) % cfg.plot_every == 0 or epoch == 0):
             visualize_predictions(
                 model, text_encoder, density_maps_dev, class_names,
                 test_queries, cfg, epoch + 1, viz_dir)
 
-            # Loss + accuracy plot
-            fig, ax1 = plt.subplots(figsize=(8, 4))
-            ax1.plot(train_losses, label="train loss", color="coral")
-            ax1.set_xlabel("Epoch")
-            ax1.set_ylabel("BCE Loss")
-            ax1.legend(loc="upper left")
-            ax2 = ax1.twinx()
-            ax2.plot(val_accs, label="val acc", color="steelblue", linestyle="--")
-            ax2.set_ylabel("Accuracy %")
-            ax2.legend(loc="upper right")
-            plt.title("Training Progress")
-            plt.tight_layout()
-            plt.savefig(viz_dir / "progress.png", dpi=120)
-            plt.close(fig)
-
-            # Checkpoint
-            Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
-            torch.save({
-                "epoch": epoch,
-                "classifier": model.state_dict(),
-                "train_losses": train_losses,
-                "val_accs": val_accs,
-                "class_names": class_names,
-                "config": vars(cfg),
-            }, ckpt_path)
+        # --- Checkpoint (every epoch) ---
+        Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
+        torch.save({
+            "epoch": epoch,
+            "classifier": model.state_dict(),
+            "train_losses": train_losses,
+            "train_accs": train_accs,
+            "val_losses": val_losses,
+            "val_accs": val_accs,
+            "class_names": class_names,
+            "config": vars(cfg),
+        }, ckpt_path)
 
     # Final save
     Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
@@ -598,8 +620,8 @@ def main():
         lora=True,
     )
     text_encoder = text_encoder.to(device)
-    print(f"  Qwen3 loaded on {device}")
     n_lora = sum(p.numel() for p in text_encoder.parameters() if p.requires_grad)
+    print(f"  Qwen3 loaded on {device}")
     print(f"  LoRA trainable params: {n_lora:,}")
 
     # --- Step 5: Train classifier ---

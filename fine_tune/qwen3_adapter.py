@@ -27,37 +27,55 @@ from typing import Optional, List
 MODEL_ID = "Qwen/Qwen3.5-4B"
 HIDDEN_DIM = 2560
 
+# Known hidden sizes for Qwen3.5 variants
+_QWEN_HIDDEN = {
+    "Qwen/Qwen3.5-4B": 2560,
+    "Qwen/Qwen3.5-9B": 4096,
+    "Qwen/Qwen3.5-27B": 4096,  # actually 5120 — will be read from config
+    "Qwen/Qwen3.5-35B": 8192,
+}
+
 
 class Qwen3EmbeddingAdapter(nn.Module):
     def __init__(
         self,
         target_dim: int = HIDDEN_DIM,
         pretrained_encoder_path: Optional[str] = None,
+        model_id: Optional[str] = None,
         freeze_encoder: bool = True,
         lora: bool = False,
         lora_r: int = 16,
         lora_alpha: int = 32,
         lora_dropout: float = 0.05,
+        multi_gpu: bool = False,
     ):
         super().__init__()
-        self.target_dim = target_dim
         self.freeze_encoder = freeze_encoder
-        model_id = pretrained_encoder_path or MODEL_ID
+        self._multi_gpu = multi_gpu
+        resolved_model_id = model_id or pretrained_encoder_path or MODEL_ID
 
         from transformers import AutoTokenizer, AutoModel
-        print(f"[Qwen3EmbeddingAdapter] Loading {model_id}...")
-        self._tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-        self._model = AutoModel.from_pretrained(
-            model_id,
+        print(f"[Qwen3EmbeddingAdapter] Loading {resolved_model_id}...")
+        self._tokenizer = AutoTokenizer.from_pretrained(resolved_model_id, trust_remote_code=True)
+
+        load_kwargs = dict(
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
         )
+        if multi_gpu:
+            load_kwargs["device_map"] = "auto"
+            print(f"[Qwen3EmbeddingAdapter] Using device_map='auto' (multi-GPU)")
+
+        self._model = AutoModel.from_pretrained(resolved_model_id, **load_kwargs)
         cfg = self._model.config
         raw_dim = getattr(cfg, "hidden_size", None) or cfg.text_config.hidden_size
+        self.hidden_dim = raw_dim
+        self.target_dim = target_dim if target_dim != HIDDEN_DIM else raw_dim
+        print(f"[Qwen3EmbeddingAdapter] hidden_dim={raw_dim}, target_dim={self.target_dim}")
 
         self._projection: Optional[nn.Linear] = None
-        if raw_dim != target_dim:
-            self._projection = nn.Linear(raw_dim, target_dim, bias=False)
+        if raw_dim != self.target_dim:
+            self._projection = nn.Linear(raw_dim, self.target_dim, bias=False)
 
         if freeze_encoder and not lora:
             for p in self._model.parameters():
