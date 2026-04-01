@@ -37,10 +37,11 @@ class Flow3Config:
     pairs_cache: str = "pipeline_cache/pairs_855d516e8bee.pt"
     text_descriptions_path: str = "data_corine/corine_wiki_char_count.jsonl"
     hrl_descriptions_path: str = "data_corine/hrl_wiki_char_count.jsonl"
+    query_aug_path: str = "data_corine/query_augmentations.jsonl"
     output_dir: str = "training_data_flow3"
 
     # Training
-    n_epochs: int = 10
+    n_epochs: int = 30
     lr: float = 1e-4
     batch_size: int = 32
     grad_accum_steps: int = 4       # effective batch = batch_size * grad_accum_steps
@@ -232,9 +233,11 @@ def build_datasets(pairs, raw_texts, cfg):
         torch.as_tensor(p["density_map"], dtype=torch.float32) for p in pairs
     ])  # (n_classes, H, W)
 
-    # Build sentence pool
+    # Build sentence pool — separate wiki and query-style sentences
+    # Short query-style sentences (< 50 chars) are oversampled 3x
     sentence_pool = []
     texts_by_class = {i: [] for i in range(n_classes)}
+    n_query_style = 0
     for p in pairs:
         desc_key = p.get("desc_key", p["class_name"])
         cls_idx = class_to_idx[desc_key]
@@ -242,16 +245,29 @@ def build_datasets(pairs, raw_texts, cfg):
         for s in sents:
             sentence_pool.append((s, cls_idx))
             texts_by_class[cls_idx].append(s)
+            # Oversample short query-style sentences (< 50 chars)
+            if len(s) < 50:
+                for _ in range(2):  # 3x total
+                    sentence_pool.append((s, cls_idx))
+                    texts_by_class[cls_idx].append(s)
+                n_query_style += 1
+
+    print(f"  Short query-style sentences oversampled: {n_query_style} (3x each)")
 
     # Train/val split: hold out val_fraction per class
+    # Val includes both wiki and query-style sentences for realistic eval
     rng = random.Random(42)
     train_pool, val_pool = [], []
     for cls_idx in range(n_classes):
-        sents = [(s, cls_idx) for s in texts_by_class[cls_idx]]
-        rng.shuffle(sents)
-        n_val = max(1, int(len(sents) * cfg.val_fraction))
-        val_pool.extend(sents[:n_val])
-        train_pool.extend(sents[n_val:])
+        # Deduplicate for val split to avoid inflated metrics
+        unique_sents = list(set(texts_by_class[cls_idx]))
+        rng.shuffle(unique_sents)
+        n_val = max(1, int(len(unique_sents) * cfg.val_fraction))
+        val_set = set(unique_sents[:n_val])
+        val_pool.extend([(s, cls_idx) for s in unique_sents[:n_val]])
+        # Train keeps oversampled duplicates (minus val sentences)
+        train_pool.extend([(s, cls_idx) for s in texts_by_class[cls_idx]
+                           if s not in val_set])
 
     print(f"  Classes: {n_classes}")
     print(f"  Train sentences: {len(train_pool)}, Val sentences: {len(val_pool)}")
@@ -260,8 +276,21 @@ def build_datasets(pairs, raw_texts, cfg):
     return class_names, density_maps, train_pool, val_pool, texts_by_class
 
 
+def _make_short_query(sentence):
+    """Extract a short 1-5 word query from a sentence (on-the-fly augmentation)."""
+    words = sentence.split()
+    if len(words) <= 2:
+        return sentence
+    n = random.randint(1, min(5, len(words)))
+    start = random.randint(0, len(words) - n)
+    return " ".join(words[start:start + n])
+
+
 def sample_batch(train_pool, texts_by_class, n_classes, cfg):
     """Build a mixed batch: single-class + synthetic multi-class + negatives.
+
+    ~20% of single-class samples are converted to short keyword queries
+    to bridge the gap between wiki-style training text and real user queries.
 
     Returns:
         texts:  List[str] of length batch_size
@@ -275,9 +304,11 @@ def sample_batch(train_pool, texts_by_class, n_classes, cfg):
     texts = []
     labels = torch.zeros(bs, n_classes)
 
-    # Single-class samples
+    # Single-class samples (20% converted to short keyword queries)
     for i in range(n_single):
         sent, cls_idx = random.choice(train_pool)
+        if random.random() < 0.2:
+            sent = _make_short_query(sent)
         texts.append(sent)
         labels[i, cls_idx] = 1.0
 
@@ -458,7 +489,7 @@ def train(model, text_encoder, density_maps, class_names,
             with torch.autocast(qwen_device.type, dtype=torch.bfloat16):
                 embs = text_encoder(input_ids, attn_mask)
                 logits = model(embs.to(device))
-                loss = loss_fn(logits, labels) / cfg.grad_accum_steps
+                loss = loss_fn(logits, labels.to(logits.device)) / cfg.grad_accum_steps
 
             loss.backward()
 
@@ -472,10 +503,11 @@ def train(model, text_encoder, density_maps, class_names,
             # Accuracy on single-class samples only
             with torch.no_grad():
                 preds = (torch.sigmoid(logits) > 0.5).float()
-                single_mask = (labels.sum(dim=-1) == 1)
+                labels_dev = labels.to(logits.device)
+                single_mask = (labels_dev.sum(dim=-1) == 1)
                 if single_mask.any():
                     n_correct += (preds[single_mask].argmax(dim=-1) ==
-                                  labels[single_mask].argmax(dim=-1)).sum().item()
+                                  labels_dev[single_mask].argmax(dim=-1)).sum().item()
                     n_total += single_mask.sum().item()
 
             pbar.set_postfix({
@@ -511,11 +543,11 @@ def train(model, text_encoder, density_maps, class_names,
                 with torch.autocast(qwen_device.type, dtype=torch.bfloat16):
                     embs_v = text_encoder(input_ids_v, attn_mask_v)
                     logits_v = model(embs_v.to(device))
-                    v_loss_sum += loss_fn(logits_v, labels_v).item()
+                    v_loss_sum += loss_fn(logits_v, labels_v.to(logits_v.device)).item()
                     v_batches += 1
 
                 preds_v = logits_v.argmax(dim=-1)
-                targets_v = labels_v.argmax(dim=-1)
+                targets_v = labels_v.to(logits_v.device).argmax(dim=-1)
                 v_correct += (preds_v == targets_v).sum().item()
                 v_total += len(batch)
 
@@ -596,15 +628,226 @@ def train(model, text_encoder, density_maps, class_names,
 # MAIN
 # ============================================================
 
+def predict(text, model, text_encoder, density_maps, class_names, top_k=5):
+    """Run inference on a single text query.
+
+    Returns:
+        merged: (H, W) density map
+        top_classes: list of (class_name, probability) tuples
+        all_probs: (C,) tensor of all class probabilities
+    """
+    model.eval()
+    text_encoder.eval()
+    with torch.no_grad():
+        emb = text_encoder.encode_raw(text)
+        logits = model(emb.to(next(model.parameters()).device))
+        probs = torch.sigmoid(logits)  # (1, C)
+        merged = merge_maps(probs.to(density_maps.device), density_maps)  # (1, H, W)
+        top_vals, top_idx = probs[0].topk(min(top_k, len(class_names)))
+        top_classes = [(class_names[i], p.item()) for i, p in zip(top_idx.cpu(), top_vals)]
+    return merged[0], top_classes, probs[0]
+
+
+def load_for_inference(checkpoint_path, device="cuda", multi_gpu=False):
+    """Load a trained flow_3 model for inference.
+
+    Args:
+        checkpoint_path: path to flow3_model.pt or checkpoint.pt
+        device: torch device
+        multi_gpu: split Qwen across GPUs
+
+    Returns:
+        model, text_encoder, density_maps, class_names, cfg
+    """
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    config = ckpt["config"]
+    cfg = Flow3Config(**{k: v for k, v in config.items()
+                         if k in Flow3Config.__dataclass_fields__})
+    class_names = ckpt["class_names"]
+
+    # Density maps: in final save or need to load from pairs cache
+    if "density_maps" in ckpt:
+        density_maps = ckpt["density_maps"].to(device)
+    else:
+        pairs = torch.load(cfg.pairs_cache, map_location="cpu", weights_only=False)
+        density_maps = torch.stack([p["density_map"] for p in pairs]).to(device)
+
+    # Detect LoRA rank from checkpoint weights
+    lora_state = ckpt.get("qwen_lora", {})
+    lora_r = 16  # default
+    for k, v in lora_state.items():
+        if "lora_A" in k:
+            lora_r = v.shape[0]
+            break
+    lora_alpha = lora_r * 2
+    print(f"  Detected LoRA rank from checkpoint: r={lora_r}, alpha={lora_alpha}")
+
+    # Qwen encoder
+    from fine_tune.qwen3_adapter import Qwen3EmbeddingAdapter
+    text_encoder = Qwen3EmbeddingAdapter(
+        model_id=cfg.qwen_model_id,
+        freeze_encoder=True,
+        lora=True,
+        lora_r=lora_r,
+        lora_alpha=lora_alpha,
+        multi_gpu=multi_gpu,
+    )
+    print(f"  Adapter created with lora_r={lora_r}")
+    # Restore LoRA weights
+    if lora_state:
+        text_encoder.load_state_dict(lora_state, strict=False)
+        print(f"  Restored {len(lora_state)} LoRA weight tensors (r={lora_r})")
+    text_encoder = text_encoder.to(device)
+    text_encoder.eval()
+
+    # Classifier head
+    n_classes = len(class_names)
+    qwen_dim = cfg.qwen_emb_dim or text_encoder.target_dim
+    model = TextClassifier(n_classes=n_classes, qwen_dim=qwen_dim)
+    model.load_state_dict(ckpt["classifier"])
+    model = model.to(device)
+    model.eval()
+
+    print(f"Loaded flow_3 model: {n_classes} classes, maps {density_maps.shape}")
+    return model, text_encoder, density_maps, class_names, cfg
+
+
+def render_query(query, model, text_encoder, density_maps, class_names, cfg,
+                 viz_dir=None, show_in_terminal=True):
+    """Process a single query: print results, show map in terminal, optionally save."""
+    import subprocess
+    import tempfile
+
+    merged, top_classes, _ = predict(
+        query, model, text_encoder, density_maps, class_names, top_k=10)
+
+    print(f"\n  Top classes:")
+    for name, prob in top_classes:
+        bar = "█" * int(prob * 30)
+        print(f"    {prob:.3f} {bar} {name}")
+
+    # Render map image
+    extent = [cfg.lon_min, cfg.lon_max, cfg.lat_max, cfg.lat_min]
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 5))
+
+    names = [n for n, _ in top_classes[:10]]
+    vals = [p for _, p in top_classes[:10]]
+    ax1.barh(names[::-1], vals[::-1], color="steelblue")
+    ax1.set_xlim(0, 1)
+    ax1.set_title("Class probabilities")
+
+    ax2.imshow(merged.cpu().numpy(), extent=extent,
+               cmap="YlOrRd", vmin=0, vmax=1, aspect="auto")
+    ax2.set_title("Merged density map")
+    ax2.set_xlabel("Longitude")
+    ax2.set_ylabel("Latitude")
+
+    slug = query[:40].replace(" ", "_").replace("/", "_")
+    fig.suptitle(f'"{query}"', fontsize=12)
+    plt.tight_layout()
+
+    # Save to viz_dir if requested
+    if viz_dir:
+        viz_dir = Path(viz_dir)
+        viz_dir.mkdir(parents=True, exist_ok=True)
+        save_path = viz_dir / f"infer_{slug}.png"
+        plt.savefig(save_path, dpi=150)
+        print(f"  Saved: {save_path}")
+
+    # Display in terminal via chafa
+    if show_in_terminal:
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=True) as tmp:
+            plt.savefig(tmp.name, dpi=150)
+            plt.close(fig)
+            try:
+                subprocess.run(["chafa", "--size=120x30", tmp.name], check=True)
+            except FileNotFoundError:
+                print("  (install chafa for inline terminal images)")
+    else:
+        plt.close(fig)
+
+
+def run_inference(args):
+    """Interactive CLI chat mode. Load model once, then accept queries in a loop."""
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+    model, text_encoder, density_maps, class_names, cfg = \
+        load_for_inference(args.checkpoint, device=device, multi_gpu=args.multi_gpu)
+
+    viz_dir = args.save_viz
+
+    # If queries provided on command line, run those and exit
+    if args.query:
+        for query in args.query:
+            print(f"\nQuery: \"{query}\"")
+            render_query(query, model, text_encoder, density_maps, class_names, cfg, viz_dir)
+        return
+
+    # Interactive mode
+    print(f"\nReady. Type a query and press Enter. Commands: :quit, :viz <dir>")
+    print(f"  Saving viz to: {viz_dir or '(off, use :viz <dir> to enable)'}")
+    while True:
+        try:
+            query = input("\n> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nBye.")
+            break
+        if not query:
+            continue
+        if query in (":quit", ":q", ":exit"):
+            break
+        if query.startswith(":viz "):
+            viz_dir = query[5:].strip() or None
+            print(f"  Viz dir: {viz_dir or '(off)'}")
+            continue
+        if query == ":viz":
+            viz_dir = None
+            print("  Viz disabled")
+            continue
+        if query == ":classes":
+            for i, name in enumerate(class_names):
+                print(f"  {i:2d}  {name}")
+            continue
+
+        render_query(query, model, text_encoder, density_maps, class_names, cfg, viz_dir)
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--device", default=None)
-    parser.add_argument("--output-dir", default=None)
-    parser.add_argument("--model", default=None,
-                        help="Qwen model ID, e.g. Qwen/Qwen3.5-27B")
-    parser.add_argument("--multi-gpu", action="store_true",
-                        help="Split model across all GPUs via device_map='auto'")
+    sub = parser.add_subparsers(dest="mode")
+
+    # --- train mode (default) ---
+    train_p = sub.add_parser("train", help="Train classifier")
+    train_p.add_argument("--device", default=None)
+    train_p.add_argument("--output-dir", default=None)
+    train_p.add_argument("--model", default=None,
+                         help="Qwen model ID, e.g. Qwen/Qwen3.5-27B")
+    train_p.add_argument("--multi-gpu", action="store_true")
+
+    # --- infer mode ---
+    infer_p = sub.add_parser("infer", help="Run inference on text queries")
+    infer_p.add_argument("query", nargs="*", help="Text queries (omit for interactive mode)")
+    infer_p.add_argument("--checkpoint", required=True,
+                         help="Path to flow3_model.pt or checkpoint.pt")
+    infer_p.add_argument("--device", default=None)
+    infer_p.add_argument("--multi-gpu", action="store_true")
+    infer_p.add_argument("--save-viz", default=None,
+                         help="Directory to save visualization PNGs")
+
     args = parser.parse_args()
+
+    # Default to train if no subcommand
+    if args.mode == "infer":
+        run_inference(args)
+        return
+
+    # --- Training ---
+    if args.mode is None:
+        # Backwards compat: no subcommand = train
+        args.device = getattr(args, "device", None)
+        args.output_dir = getattr(args, "output_dir", None)
+        args.model = getattr(args, "model", None)
+        args.multi_gpu = getattr(args, "multi_gpu", False)
 
     cfg = Flow3Config()
     if args.output_dir:
@@ -629,7 +872,7 @@ def main():
     print("=" * 60)
     raw_texts = load_raw_texts(
         cfg.text_descriptions_path,
-        extra_paths=[cfg.hrl_descriptions_path],
+        extra_paths=[cfg.hrl_descriptions_path, cfg.query_aug_path],
     )
 
     # --- Step 3: Build datasets ---

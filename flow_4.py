@@ -41,11 +41,11 @@ from flow_3 import load_raw_texts, _KEEP_PATTERNS, _DROP_PATTERNS
 @dataclass
 class Flow4Config:
     # Data
-    pairs_cache: str = "pipeline_cache/pairs_266240ae3497.pt"
-    sat_grid_path: str = "pipeline_cache/sat_grid_1dffdd1c79c3.npy"
+    pairs_cache: str = "pipeline_cache/pairs_7c381c15589c.pt"
+    sat_grid_path: str = "pipeline_cache/sat_grid_27317cfe3740.npy"
     text_descriptions_path: str = "data_corine/corine_wiki_char_count.jsonl"
     hrl_descriptions_path: str = "data_corine/hrl_wiki_char_count.jsonl"
-    output_dir: str = "training_data_flow4_v3"
+    output_dir: str = "training_data_flow4_v4_extended"
 
     # Satellite
     sat_emb_dim: int = 64
@@ -79,6 +79,22 @@ class Flow4Config:
     # Qwen
     qwen_model_id: str = "Qwen/Qwen3.5-9B"
     qwen_emb_dim: int = 0  # auto-detect
+
+    # LLM query augmentation
+    # Generates K extra descriptions per class via a local llama-server to
+    # close the train/inference gap (training sees Wikipedia sentences;
+    # inference queries tend to be short phrases).
+    llm_expand_url: str = "http://192.168.242.180:8080/v1"
+    llm_expand_k: int = 5       # descriptions to generate per class
+    llm_expand_cache: str = "pipeline_cache/llm_augmented_texts_{key}.json"  # {key} filled at runtime
+    llm_expand_enabled: bool = True
+
+    # Named geographic features (Option C)
+    # Fetched from OSM via Nominatim, rasterized onto the sat grid, and injected
+    # as extra training classes so the model learns named-place → land-cover mapping.
+    geo_features_enabled: bool = True
+    geo_features_cache: str = "pipeline_cache/geo_pairs_{H}x{W}.pt"  # {H},{W} filled at runtime
+    geo_river_buffer_deg: float = 0.008  # ~900 m corridor buffer for linear features
 
 
 # ============================================================
@@ -318,6 +334,173 @@ def _augment_neither_sentences(sents):
     return augmented, n_augmented
 
 
+# Named Hungarian geographic features to inject as training classes.
+# (display_name, nominatim_query, is_linear)
+# is_linear=True → geometry is buffered by geo_river_buffer_deg before rasterizing.
+_GEO_FEATURES = [
+    ("Lake Balaton",         "Balaton, Hungary",         False),
+    ("Lake Velence",         "Velencei-tó, Hungary",     False),
+    ("Lake Fertő",           "Fertő, Hungary",           False),
+    ("Kis-Balaton wetland",  "Kis-Balaton, Hungary",     False),
+    ("Danube river",         "Duna, Magyarország",       True),
+    ("Tisza river",          "Tisza, Hungary",           True),
+    ("Hortobágy steppe",     "Hortobágy, Hungary",       False),
+    ("Gemenc floodplain",    "Gemenc, Hungary",          False),
+]
+
+
+def _fetch_nominatim_geometry(query: str):
+    """Fetch the boundary polygon for a named place via Nominatim GeoJSON API."""
+    import requests
+    from shapely.geometry import shape
+    try:
+        resp = requests.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={"q": query, "format": "geojson", "polygon_geojson": 1, "limit": 1},
+            headers={"User-Agent": "zero-crop-training/1.0"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        features = resp.json().get("features", [])
+        if not features:
+            return None
+        return shape(features[0]["geometry"])
+    except Exception as e:
+        print(f"    [geo] Nominatim failed for '{query}': {e}")
+        return None
+
+
+def _rasterize_geom(geom, H: int, W: int, cfg) -> np.ndarray:
+    """Rasterize a shapely geometry onto the (H, W) grid, clipped to the Hungary bbox."""
+    from shapely.geometry import box
+    from shapely import contains_xy
+    bbox = box(cfg.lon_min, cfg.lat_min, cfg.lon_max, cfg.lat_max)
+    clipped = geom.intersection(bbox)
+    if clipped.is_empty:
+        return None
+    lons = np.linspace(cfg.lon_min, cfg.lon_max, W)
+    lats = np.linspace(cfg.lat_max, cfg.lat_min, H)   # row 0 = north
+    lon_grid, lat_grid = np.meshgrid(lons, lats)
+    mask = contains_xy(clipped, lon_grid.ravel(), lat_grid.ravel()).reshape(H, W)
+    return mask.astype(np.float32)
+
+
+def build_or_load_geo_pairs(H: int, W: int, cfg, cache_dir: Path) -> list:
+    """Build density maps for named Hungarian geographic features from OSM.
+
+    Returns list of pair dicts {class_name, desc_key, density_map} — same format
+    as CORINE pairs so they can be appended directly to the pairs list.
+
+    Cache key includes H×W so changing resolution auto-invalidates.
+    Delete the cache file to force a re-fetch from Nominatim.
+    """
+    cache_path = cache_dir / f"geo_pairs_{H}x{W}.pt"
+    if cache_path.exists():
+        pairs = torch.load(cache_path, map_location="cpu", weights_only=False)
+        print(f"  [geo] cache HIT → {cache_path.name}  ({len(pairs)} features)")
+        return pairs
+
+    print(f"  [geo] Fetching {len(_GEO_FEATURES)} named features from Nominatim ...")
+    pairs = []
+    for name, query, is_linear in _GEO_FEATURES:
+        print(f"    {name!r} ...", end=" ", flush=True)
+        geom = _fetch_nominatim_geometry(query)
+        if geom is None:
+            print("SKIP (no geometry)")
+            continue
+        if is_linear:
+            geom = geom.buffer(cfg.geo_river_buffer_deg)
+        dm = _rasterize_geom(geom, H, W, cfg)
+        if dm is None or dm.sum() == 0:
+            print("SKIP (empty after clip to bbox)")
+            continue
+        pairs.append({"class_name": name, "desc_key": name, "density_map": dm})
+        print(f"OK  ({int(dm.sum()):,} cells, {dm.sum()/dm.size*100:.1f}% of grid)")
+
+    torch.save(pairs, cache_path)
+    print(f"  [geo] {len(pairs)} features cached → {cache_path.name}")
+    return pairs
+
+
+_LLM_EXPAND_SYSTEM = (
+    "You are a geographic land-cover encyclopedia specializing in satellite-observable features. "
+    "Given a land cover class name or a named geographic feature, write exactly 2–3 Wikipedia-style "
+    "sentences describing it in terms of what a satellite would observe: "
+    "the land cover type, surface characteristics, spectral signature, ecology, and spatial extent "
+    "in Central Europe or Hungary. "
+    "If the input is a named place (lake, river, mountain, city, national park), translate it "
+    "into its land cover description — describe what the feature IS and looks like from above, "
+    "NOT just where it is. Do NOT repeat the proper name in the output. "
+    "Do NOT include headings, bullet points, or meta-commentary. "
+    "Output only the description sentences."
+)
+
+
+def build_llm_augmented_texts(class_names: list, cfg) -> dict:
+    """Generate K LLM descriptions per class, cached to disk.
+
+    Returns {class_name: [sentence, ...]} or {} if LLM is unavailable.
+    The cache is keyed by (class_names, k, url) so changing any of those
+    invalidates it automatically.
+    """
+    import json, hashlib
+
+    cache_key = hashlib.md5(
+        f"{sorted(class_names)}|{cfg.llm_expand_k}|{cfg.llm_expand_url}".encode()
+    ).hexdigest()[:12]
+    # Key is embedded in the filename — different class sets → different files, never overwrite
+    cache_path = Path(cfg.llm_expand_cache.replace("{key}", cache_key))
+
+    if cache_path.exists():
+        with open(cache_path) as f:
+            cached = json.load(f)
+        total = sum(len(v) for k, v in cached.items() if not k.startswith("_"))
+        print(f"  [LLM aug] cache HIT → {cache_path.name}  ({total} sentences for {len(class_names)} classes)")
+        return {k: v for k, v in cached.items() if not k.startswith("_")}
+
+    try:
+        from openai import OpenAI
+        client = OpenAI(base_url=cfg.llm_expand_url, api_key="none")
+        # Quick health check
+        client.models.list()
+    except Exception as e:
+        print(f"  [LLM aug] server unreachable ({e}) — skipping augmentation")
+        return {}
+
+    augmented = {}
+    print(f"  [LLM aug] generating {cfg.llm_expand_k} descriptions × {len(class_names)} classes "
+          f"from {cfg.llm_expand_url} ...")
+    for name in class_names:
+        sents = []
+        for _ in range(cfg.llm_expand_k):
+            try:
+                resp = client.chat.completions.create(
+                    model="qwen",
+                    messages=[
+                        {"role": "system", "content": _LLM_EXPAND_SYSTEM},
+                        {"role": "user", "content": name},
+                    ],
+                    max_tokens=-1,
+                    temperature=0.7,   # diversity across K samples
+                )
+                text = resp.choices[0].message.content.strip()
+                if text:
+                    sents.append(text)
+            except Exception as e:
+                print(f"    [LLM aug] failed for '{name}': {e}")
+                break
+        augmented[name] = sents
+        print(f"    {name}: {len(sents)} sentences")
+
+    # Save cache — filename encodes the key, so old caches are never overwritten
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(cache_path, "w") as f:
+        json.dump(augmented, f, indent=2)
+    total = sum(len(v) for v in augmented.values())
+    print(f"  [LLM aug] {total} sentences saved → {cache_path.name}")
+    return augmented
+
+
 def build_datasets(pairs, raw_texts, cfg):
     """Build class names, centroids, density maps, and text pools."""
     class_names = []
@@ -340,6 +523,19 @@ def build_datasets(pairs, raw_texts, cfg):
         cls_idx = class_to_idx[desc_key]
         sents = raw_texts.get(desc_key, [f"{p['class_name']} in Hungary"])
         texts_by_class[cls_idx].extend(sents)
+
+    # LLM-generated descriptions — closes the train/inference gap:
+    # training sees Wikipedia sentences; inference queries are short phrases that
+    # get expanded by the same LLM prompt, so including LLM text in training
+    # ensures the model sees both registers.
+    if cfg.llm_expand_enabled:
+        llm_texts = build_llm_augmented_texts(class_names, cfg)
+        n_llm = 0
+        for cls_idx, name in enumerate(class_names):
+            extra = llm_texts.get(name, [])
+            texts_by_class[cls_idx].extend(extra)
+            n_llm += len(extra)
+        print(f"  LLM-augmented sentences added: {n_llm}")
 
     # Augment 'neither' sentences with their closest keep sentence
     total_augmented = 0
@@ -738,6 +934,20 @@ def main():
     if args.model:
         cfg.qwen_model_id = args.model
 
+    # Never overwrite a completed training run — bump version suffix if needed
+    out = Path(cfg.output_dir)
+    if (out / "flow4_model.pt").exists():
+        import re
+        base = re.sub(r"_v\d+$", "", str(out))
+        v = 1
+        while True:
+            candidate = Path(f"{base}_v{v}")
+            if not (candidate / "flow4_model.pt").exists():
+                cfg.output_dir = str(candidate)
+                print(f"  [safe] '{out}' has a completed model — using '{candidate}' instead")
+                break
+            v += 1
+
     multi_gpu = args.multi_gpu
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}, multi_gpu: {multi_gpu}")
@@ -846,6 +1056,16 @@ def main():
     sat_grid_flat_norm[~hungary_mask_flat] = 0.0
     print(f"  Hungary mask applied: {hungary_mask_flat.sum():,} valid cells "
           f"({hungary_mask_flat.float().mean()*100:.1f}%)")
+
+    # --- Step 2b: Named geographic features ---
+    if cfg.geo_features_enabled:
+        print("\n" + "=" * 60)
+        print("STEP 2b: Named geographic features (OSM → density maps)")
+        print("=" * 60)
+        geo_pairs = build_or_load_geo_pairs(H, W, cfg, cache_dir)
+        if geo_pairs:
+            pairs = list(pairs) + geo_pairs
+            print(f"  Total pairs after geo injection: {len(pairs)}")
 
     # --- Step 3: Compute centroids ---
     print("\n" + "=" * 60)
