@@ -56,14 +56,14 @@ class Flow4Config:
 
     # Contrastive
     init_temperature: float = 0.07
-    pixel_loss_weight: float = 0.25
+    pixel_loss_weight: float = 1.0
     density_loss_weight: float = 1.0
-    distractor_loss_weight: float = 0.1
-    n_pos_pixels: int = 64
-    n_neg_pixels: int = 64
+    distractor_loss_weight: float = 0.3
+    n_pos_pixels: int = 128
+    n_neg_pixels: int = 128
 
     # Training
-    n_epochs: int = 50
+    n_epochs: int = 20
     lr: float = 1e-4
     batch_size: int = 256 # = all classes per step
     grad_accum_steps: int = 2
@@ -87,7 +87,7 @@ class Flow4Config:
     llm_expand_url: str = "http://192.168.242.180:8080/v1"
     llm_expand_k: int = 5       # descriptions to generate per class
     llm_expand_cache: str = "pipeline_cache/llm_augmented_texts_{key}.json"  # {key} filled at runtime
-    llm_expand_enabled: bool = True
+    llm_expand_enabled: bool = False
 
     # Named geographic features (Option C)
     # Fetched from OSM via Nominatim, rasterized onto the sat grid, and injected
@@ -126,7 +126,132 @@ class LearnableTemperature(nn.Module):
         self.log_temp = nn.Parameter(torch.tensor(math.log(1.0 / init_temp)))
 
     def forward(self):
-        return self.log_temp.exp().clamp(min=0.01, max=100.0)
+        return self.log_temp.exp().clamp(min=1.0, max=20.0)
+
+
+# ============================================================
+# CORINE code → human-readable name (standard CLC nomenclature)
+# ============================================================
+
+_CORINE_NAMES = {
+    "111": "Continuous urban fabric",
+    "112": "Discontinuous urban fabric",
+    "121": "Industrial or commercial units",
+    "122": "Road and rail networks",
+    "123": "Port areas",
+    "124": "Airports",
+    "131": "Mineral extraction sites",
+    "132": "Dump sites",
+    "133": "Construction sites",
+    "141": "Green urban areas",
+    "142": "Sport and leisure facilities",
+    "211": "Non-irrigated arable land",
+    "212": "Permanently irrigated land",
+    "213": "Rice fields",
+    "221": "Vineyards",
+    "222": "Fruit trees and berry plantations",
+    "223": "Olive groves",
+    "231": "Pastures",
+    "241": "Annual crops with permanent crops",
+    "242": "Complex cultivation patterns",
+    "243": "Agriculture with natural vegetation",
+    "244": "Agro-forestry areas",
+    "311": "Broad-leaved forest",
+    "312": "Coniferous forest",
+    "313": "Mixed forest",
+    "321": "Natural grasslands",
+    "322": "Moors and heathland",
+    "323": "Sclerophyllous vegetation",
+    "324": "Transitional woodland-shrub",
+    "331": "Beaches dunes sands",
+    "332": "Bare rocks",
+    "333": "Sparsely vegetated areas",
+    "334": "Burnt areas",
+    "335": "Glaciers and perpetual snow",
+    "411": "Inland marshes",
+    "412": "Peat bogs",
+    "421": "Salt marshes",
+    "422": "Salines",
+    "423": "Intertidal flats",
+    "511": "Water courses",
+    "512": "Water bodies",
+    "521": "Coastal lagoons",
+    "522": "Estuaries",
+    "523": "Sea and ocean",
+}
+
+
+# ============================================================
+# CLASS GROUPS — classes that share the same satellite spectral
+# cluster and must NOT be treated as negatives in InfoNCE.
+# ============================================================
+
+_CLASS_GROUPS = {
+    # Water: all still/flowing water + named features (same sat cluster)
+    "511": "water",
+    "512": "water",
+    "Lake Balaton": "water",
+    "Lake Velence": "water",
+    "Lake Fertő": "water",
+    "Kis-Balaton wetland": "water",
+    "Danube river": "water",
+    "Tisza river": "water",
+
+    # Wetland: marshes/floodplains (spectral overlap with water edges)
+    "411": "wetland",
+    "Gemenc floodplain": "wetland",
+
+    # Forest: all tree canopy types (IoU 0.45-0.91)
+    "311": "forest",
+    "312": "forest",
+    "313": "forest",
+    "324": "forest",
+
+    # Grassland: grass/low vegetation
+    "321": "grassland",
+    "231": "grassland",
+    "permanent_grassland": "grassland",
+    "Hortobágy steppe": "grassland",
+
+    # Arable: broad-acre crops + temporal phases (IoU 0.80-0.99)
+    "wheat": "arable",
+    "barley": "arable",
+    "maize": "arable",
+    "other_cereals": "arable",
+    "rapeseed": "arable",
+    "sunflower": "arable",
+    "211": "arable",
+    "unclassified_arable": "arable",
+    "main_crop_harvest_date": "arable",
+    "bare_soil_before_sowing": "arable",
+    "bare_soil_after_harvest": "arable",
+
+    # Mixed agriculture (IoU 0.86)
+    "242": "mixed_agri",
+    "243": "mixed_agri",
+
+    # Vineyards/orchards only — genuine spatial overlap (IoU 0.32-0.35)
+    # olives, nuts, unclassified_permanent are too tiny/disjoint to group
+    "grapes": "perm_crop",
+    "221": "perm_crop",
+    "222": "perm_crop",
+    "fruits": "perm_crop",
+}
+# Classes not listed → singleton group (no masking applied)
+
+
+def build_same_group_mask(class_names):
+    """Build (N, N) bool mask: True where i≠j but same spectral group."""
+    N = len(class_names)
+    group_ids = []
+    for i, name in enumerate(class_names):
+        group_ids.append(_CLASS_GROUPS.get(name, f"_singleton_{i}"))
+    mask = torch.zeros(N, N, dtype=torch.bool)
+    for i in range(N):
+        for j in range(N):
+            if i != j and group_ids[i] == group_ids[j]:
+                mask[i, j] = True
+    return mask
 
 
 # ============================================================
@@ -149,8 +274,9 @@ def centroid_infonce_loss(text_embs, sat_centroids, temperature):
     return (loss_t2s + loss_s2t) / 2
 
 
-def density_weighted_infonce_loss(text_embs, sat_grid_flat, density_maps_flat, temperature):
-    """Distribution-aligned InfoNCE.
+def density_weighted_infonce_loss(text_embs, sat_grid_flat, density_maps_flat,
+                                  temperature, same_group_mask=None):
+    """Distribution-aligned InfoNCE with optional same-group masking.
 
     Score between text_i and class_j = expected cosine similarity under class j's
     spatial distribution:
@@ -159,20 +285,18 @@ def density_weighted_infonce_loss(text_embs, sat_grid_flat, density_maps_flat, t
     Preserves spatial spread — bimodal distributions stay bimodal instead of
     collapsing to a geographically meaningless centroid.
 
-    text_embs:         (N, 64)   L2-normalized
-    sat_grid_flat:     (H*W, 64) L2-normalized
-    density_maps_flat: (N, H*W)  raw density values
-    temperature:       scalar
+    same_group_mask: (N, N) bool — True where i≠j but same spectral group.
+    Masked positions are set to -inf so they don't act as negatives.
     """
     N = text_embs.shape[0]
-    # (N, H*W) cosine similarity of each text to every satellite cell
     sim = text_embs @ sat_grid_flat.T
 
-    # row-normalize density maps → probability distributions
     dm_norm = density_maps_flat / (density_maps_flat.sum(dim=1, keepdim=True) + 1e-8)
 
-    # scores[i,j] = expected sim of text_i under class_j's distribution
     scores = (sim @ dm_norm.T) * temperature  # (N, N)
+
+    if same_group_mask is not None:
+        scores = scores.masked_fill(same_group_mask.to(scores.device), float('-inf'))
 
     labels = torch.arange(N, device=text_embs.device)
     loss_t2s = F.cross_entropy(scores, labels)
@@ -181,17 +305,35 @@ def density_weighted_infonce_loss(text_embs, sat_grid_flat, density_maps_flat, t
 
 
 def pixel_contrastive_loss(text_embs, sat_grid_flat, density_maps_flat,
-                           class_indices, n_pos, n_neg, temperature):
-    """Pixel-level contrastive: text vs sampled positive/negative grid cells.
+                           class_indices, n_pos, n_neg, temperature,
+                           sat_centroids=None, same_group_mask=None):
+    """Pixel-level contrastive with hard negative mining (vectorized).
 
     text_embs:        (B, 64) L2-normalized
     sat_grid_flat:    (H*W, 64) L2-normalized
     density_maps_flat: (n_classes, H*W)
     class_indices:    (B,) class index per text
+    sat_centroids:    (n_classes, 64) for hard negative mining (optional)
+    same_group_mask:  (n_classes, n_classes) bool — skip same-group for hard negs
     """
     B = text_embs.shape[0]
+    n_classes = density_maps_flat.shape[0]
     device = text_embs.device
     losses = []
+
+    # Precompute class similarities for hard negative mining
+    hard_neg_classes = None
+    if sat_centroids is not None and n_classes > 3:
+        with torch.no_grad():
+            cls_sim = sat_centroids @ sat_centroids.T  # (C, C)
+            # Zero out self-similarity and same-group pairs
+            cls_sim.fill_diagonal_(-1.0)
+            if same_group_mask is not None:
+                cls_sim[same_group_mask.to(cls_sim.device)] = -1.0
+            # Top-3 most similar classes per class (excluding self + same group)
+            hard_neg_classes = cls_sim.topk(min(3, n_classes - 1)).indices  # (C, 3)
+
+    n_hard = n_neg // 2  # half from confusable classes, half random
 
     for i in range(B):
         cls = class_indices[i]
@@ -209,29 +351,53 @@ def pixel_contrastive_loss(text_embs, sat_grid_flat, density_maps_flat,
             weights = weights / weights.sum()
             pos_sample = pos_indices[torch.multinomial(weights, n_pos, replacement=False)]
 
-        # Negative: cells with zero density for this class
+        # Negative sampling: hard + random
         neg_mask = dm < 1e-6
         neg_indices = neg_mask.nonzero(as_tuple=True)[0]
         if len(neg_indices) == 0:
             continue
-        if len(neg_indices) > n_neg:
-            neg_sample = neg_indices[torch.randint(len(neg_indices), (n_neg,), device=device)]
-        else:
-            neg_sample = neg_indices
+
+        neg_parts = []
+
+        # Hard negatives: sample from high-density cells of confusable classes
+        if hard_neg_classes is not None:
+            hard_pool = []
+            for conf_cls in hard_neg_classes[cls]:
+                conf_dm = density_maps_flat[conf_cls]
+                # Cells that are high-density for the confusable class but
+                # NOT high-density for our class (the discriminative boundary)
+                hard_mask = (conf_dm > 1e-4) & neg_mask
+                hard_idx = hard_mask.nonzero(as_tuple=True)[0]
+                if len(hard_idx) > 0:
+                    hard_pool.append(hard_idx)
+            if hard_pool:
+                hard_pool = torch.cat(hard_pool)
+                n_sample = min(n_hard, len(hard_pool))
+                hard_sample = hard_pool[torch.randint(len(hard_pool), (n_sample,), device=device)]
+                neg_parts.append(hard_sample)
+
+        # Random negatives: fill remaining budget
+        n_random = n_neg - (len(neg_parts[0]) if neg_parts else 0)
+        if n_random > 0 and len(neg_indices) > 0:
+            n_sample = min(n_random, len(neg_indices))
+            rand_sample = neg_indices[torch.randint(len(neg_indices), (n_sample,), device=device)]
+            neg_parts.append(rand_sample)
+
+        if not neg_parts:
+            continue
+        neg_sample = torch.cat(neg_parts)
 
         pos_embs = sat_grid_flat[pos_sample]  # (n_p, 64)
         neg_embs = sat_grid_flat[neg_sample]  # (n_n, 64)
 
-        # For each positive: InfoNCE against all negatives
-        # sim_pos: (n_p,), sim_neg: (n_p, n_n)
-        sim_pos = (text_embs[i] * pos_embs).sum(dim=-1) * temperature  # (n_p,)
-        sim_neg = (text_embs[i:i+1] @ neg_embs.T).squeeze(0) * temperature  # (n_n,)
+        # Vectorized: (n_p, 1) positive sims + (n_p, n_n) negative sims
+        sim_pos = (text_embs[i] * pos_embs).sum(dim=-1, keepdim=True) * temperature  # (n_p, 1)
+        sim_neg = (text_embs[i:i+1] @ neg_embs.T) * temperature  # (1, n_n)
+        sim_neg = sim_neg.expand(len(pos_sample), -1)  # (n_p, n_n)
 
-        # Each positive is classified against all negatives
-        for p_idx in range(len(pos_sample)):
-            logits = torch.cat([sim_pos[p_idx:p_idx+1], sim_neg])  # (1+n_n,)
-            losses.append(F.cross_entropy(logits.unsqueeze(0),
-                                          torch.zeros(1, dtype=torch.long, device=device)))
+        logits = torch.cat([sim_pos, sim_neg], dim=1)  # (n_p, 1+n_n)
+        labels = torch.zeros(len(pos_sample), dtype=torch.long, device=device)
+        losses.append(F.cross_entropy(logits, labels))
 
     if not losses:
         return torch.tensor(0.0, device=device, requires_grad=True)
@@ -521,8 +687,23 @@ def build_datasets(pairs, raw_texts, cfg):
     for p in pairs:
         desc_key = p.get("desc_key", p["class_name"])
         cls_idx = class_to_idx[desc_key]
-        sents = raw_texts.get(desc_key, [f"{p['class_name']} in Hungary"])
+        sents = raw_texts.get(desc_key, [p["class_name"]])
         texts_by_class[cls_idx].extend(sents)
+
+    # Inject CORINE human-readable names as extra training text.
+    # The raw data keys classes by numeric code ("512") but the model
+    # needs to understand queries like "water bodies" or "broad-leaved forest".
+    n_corine_injected = 0
+    for p in pairs:
+        desc_key = p.get("desc_key", p["class_name"])
+        cls_idx = class_to_idx[desc_key]
+        corine_name = _CORINE_NAMES.get(desc_key)
+        if corine_name:
+            texts_by_class[cls_idx].append(corine_name)
+            texts_by_class[cls_idx].append(
+                f"{corine_name} as observed from satellite imagery")
+            n_corine_injected += 2
+    print(f"  CORINE name sentences injected: {n_corine_injected}")
 
     # LLM-generated descriptions — closes the train/inference gap:
     # training sees Wikipedia sentences; inference queries are short phrases that
@@ -537,14 +718,8 @@ def build_datasets(pairs, raw_texts, cfg):
             n_llm += len(extra)
         print(f"  LLM-augmented sentences added: {n_llm}")
 
-    # Augment 'neither' sentences with their closest keep sentence
-    total_augmented = 0
-    for cls_idx in range(n_classes):
-        result = _augment_neither_sentences(texts_by_class[cls_idx])
-        if isinstance(result, tuple):
-            texts_by_class[cls_idx], n_aug = result
-            total_augmented += n_aug
-    print(f"  Neither-sentences augmented: {total_augmented}")
+    # Neither-sentence augmentation disabled
+    print(f"  Neither-sentence augmentation: disabled")
 
     # Train/val split
     rng = random.Random(42)
@@ -695,6 +870,12 @@ def train(proj_head, temperature, text_encoder, sat_centroids, sat_grid_flat_nor
     H, W = density_maps.shape[1], density_maps.shape[2]
     dm_flat = density_maps.reshape(n_classes, -1).to(device)
 
+    # Build same-group mask for InfoNCE masking
+    same_group_mask = build_same_group_mask(class_names)
+    n_masked = same_group_mask.sum().item() // 2  # undirected pairs
+    groups_used = set(_CLASS_GROUPS[n] for n in class_names if n in _CLASS_GROUPS)
+    print(f"  Same-group mask: {n_masked} class pairs masked across {len(groups_used)} groups")
+
     # Optimizer
     qwen_params = [p for p in text_encoder.parameters() if p.requires_grad]
     n_qwen = sum(p.numel() for p in qwen_params)
@@ -705,16 +886,22 @@ def train(proj_head, temperature, text_encoder, sat_centroids, sat_grid_flat_nor
     optimizer = torch.optim.AdamW([
         {"params": qwen_params, "lr": cfg.lr},
         {"params": proj_head.parameters(), "lr": cfg.lr * 10},
-        {"params": temperature.parameters(), "lr": cfg.lr * 10},
+        {"params": temperature.parameters(), "lr": cfg.lr},
     ])
 
     # One "batch" = one sentence per class = 40 texts
     # n_batches = enough to cycle through most training sentences per epoch
     min_pool = min(len(v) for v in train_texts.values())
-    n_batches = max(min_pool, 20)
+    n_batches = max(min_pool * 2, 40)
     total_steps = n_batches * cfg.n_epochs
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=total_steps, eta_min=1e-6)
+    warmup_steps = int(total_steps * 0.1)
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps)
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=total_steps - warmup_steps, eta_min=1e-5)
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer, schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[warmup_steps])
 
     tokenizer = text_encoder._tokenizer
     qwen_device = text_encoder.input_device
@@ -786,12 +973,18 @@ def train(proj_head, temperature, text_encoder, sat_centroids, sat_grid_flat_nor
                 projected = proj_head(embs.to(device))  # (40, 64)
                 temp = temperature()
 
-                loss_c = centroid_infonce_loss(projected, sat_centroids_dev, temp)
+                # Centroid loss: logged for monitoring only, not in backward graph
+                with torch.no_grad():
+                    loss_c = centroid_infonce_loss(projected, sat_centroids_dev, temp)
+
                 loss_dw = density_weighted_infonce_loss(
-                    projected, sat_grid_flat_dev, dm_flat, temp)
+                    projected, sat_grid_flat_dev, dm_flat, temp,
+                    same_group_mask=same_group_mask)
                 loss_p = pixel_contrastive_loss(
                     projected, sat_grid_flat_dev, dm_flat,
-                    class_indices, cfg.n_pos_pixels, cfg.n_neg_pixels, temp)
+                    class_indices, cfg.n_pos_pixels, cfg.n_neg_pixels, temp,
+                    sat_centroids=sat_centroids_dev,
+                    same_group_mask=same_group_mask)
 
                 distractor_idx = distractor_mask.nonzero(as_tuple=True)[0].to(device)
                 if len(distractor_idx) > 0:
@@ -800,15 +993,15 @@ def train(proj_head, temperature, text_encoder, sat_centroids, sat_grid_flat_nor
                 else:
                     loss_d = torch.tensor(0.0, device=device)
 
-                loss = (loss_c
-                        + cfg.density_loss_weight * loss_dw
+                loss = (cfg.density_loss_weight * loss_dw
                         + cfg.pixel_loss_weight * loss_p
                         + cfg.distractor_loss_weight * loss_d) / cfg.grad_accum_steps
 
             loss.backward()
 
             if (batch_i + 1) % cfg.grad_accum_steps == 0 or batch_i == n_batches - 1:
-                torch.nn.utils.clip_grad_norm_(qwen_params, 1.0)
+                all_params = qwen_params + list(proj_head.parameters()) + list(temperature.parameters())
+                torch.nn.utils.clip_grad_norm_(all_params, 1.0)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()

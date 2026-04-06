@@ -10,8 +10,8 @@ Usage:
     .venv/bin/python inference_flow4.py --query "wheat"
     .venv/bin/python inference_flow4.py --query "wheat" "sunflower" "deciduous forest"
     .venv/bin/python inference_flow4.py --all-classes
-    .venv/bin/python inference_flow4.py --interactive
-    .venv/bin/python inference_flow4.py --query "wheat" --checkpoint training_data_flow4_v2/checkpoint.pt
+    .venv/bin/python inference_flow4.py --interactive --checkpoint training_data_flow4_v6/checkpoint.pt
+    .venv/bin/python inference_flow4.py --query "wheat" --checkpoint training_data_flow4_v6/checkpoint.pt
 """
 
 import argparse
@@ -148,41 +148,32 @@ def load_hungary_mask(H, cache_dir="pipeline_cache"):
 # INFER
 # ============================================================
 
-_EXPAND_LLM_URL = "http://192.168.242.180:8080/v1"
-_EXPAND_SYSTEM_PROMPT = (
-    "You are a geographic land-cover encyclopedia specializing in satellite-observable features. "
-    "Given a short query term or named geographic feature, write exactly 2–3 Wikipedia-style "
-    "words describing it in terms of what a satellite would observe: "
-    "do not over complicate, rather make it simple."
-)
+_EXPAND_LLM_URL = "http://192.168.242.180:8001"
 
 
 def expand_query(query: str) -> str:
-    """Expand short queries using a local LLM to match training-data text style.
+    """Expand short queries using the LLM augmentation server's /generate endpoint.
 
     Training data is Wikipedia-style sentences about land cover. A one-word query
     like 'wheat' produces a very different Qwen embedding than a full description —
     this bridges the gap by generating a proper description first.
 
     Queries already longer than 8 words are returned unchanged (assumed descriptive enough).
-    Falls back to the original query if the LLM call fails.
+    Falls back to the original query if the call fails.
     """
     if len(query.split()) > 8:
         return query
 
     try:
-        from openai import OpenAI
-        client = OpenAI(base_url=_EXPAND_LLM_URL, api_key="none")
-        resp = client.chat.completions.create(
-            model="qwen",
-            messages=[
-                {"role": "system", "content": _EXPAND_SYSTEM_PROMPT},
-                {"role": "user", "content": query},
-            ],
-            max_tokens=-1,
-            temperature=0.2,
-        )
-        expanded = resp.choices[0].message.content.strip()
+        import requests
+        resp = requests.post(f"{_EXPAND_LLM_URL}/generate", json={
+            "class_name": query,
+            "input_text": query,
+            "task": "query_to_desc",
+            "temperature": 0.2,
+        }, timeout=30)
+        resp.raise_for_status()
+        expanded = resp.json().get("generated_text", "").strip()
         return expanded if expanded else query
     except Exception as e:
         print(f"  [expand] LLM call failed ({e}), using original query")
